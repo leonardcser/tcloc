@@ -23,8 +23,8 @@ const PAINT_BENCH: PaintId = PaintId(5);
 const GAP_SUBCELLS: u16 = 1;
 const MIN_TILE_SUBCELLS: u16 = 3;
 const MAX_LAYOUT_PASSES: u32 = 16;
-const BITMAP_MIN_TERMINAL_W: u16 = 120;
-const BITMAP_MIN_TERMINAL_H: u16 = 36;
+const BITMAP_MIN_TERMINAL_W: u16 = 144;
+const BITMAP_MIN_TERMINAL_H: u16 = 44;
 
 fn bitmap_enabled(area: Rect) -> bool {
     area.width >= BITMAP_MIN_TERMINAL_W && area.height >= BITMAP_MIN_TERMINAL_H
@@ -42,7 +42,7 @@ fn tile_color(base: Color, selected: bool, pulse: f32) -> Color {
 }
 
 const SCALE_MIN_AREA_CELLS: [(u16, u16); bitmap_font::MAX_SCALE as usize] =
-    [(80, 24), (220, 64), (260, 76)];
+    [(96, 30), (264, 80), (312, 92)];
 const LABEL_MAX_TILE_FRAC_NUM: u16 = 3;
 const LABEL_MAX_TILE_FRAC_DEN: u16 = 5;
 
