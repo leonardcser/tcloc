@@ -187,20 +187,37 @@ fn run(
             .unwrap_or(Duration::from_millis(1))
             .max(Duration::from_millis(1));
         if event::poll(poll_for)? {
+            // Drain everything that's already queued. During a fast
+            // resize drag the terminal queues many Resize events; we
+            // keep only the latest size and drop intermediates so
+            // smelt-term doesn't full-flush the screen for every pixel
+            // of motion. Non-resize events fall through unchanged.
+            let mut events = vec![event::read()?];
+            while event::poll(Duration::ZERO)? {
+                events.push(event::read()?);
+            }
             let received_at = Instant::now();
-            match handle_event(event::read()?, ui, &mut app) {
-                EventOutcome::Quit => return Ok(app),
-                EventOutcome::Redraw => {
-                    input_dirty = true;
-                    if pending_input_at.is_none() {
-                        pending_input_at = Some(received_at);
+            let last_resize_idx = events
+                .iter()
+                .rposition(|e| matches!(e, Event::Resize(_, _)));
+            for (i, ev) in events.into_iter().enumerate() {
+                if matches!(ev, Event::Resize(_, _)) && Some(i) != last_resize_idx {
+                    continue;
+                }
+                match handle_event(ev, ui, &mut app) {
+                    EventOutcome::Quit => return Ok(app),
+                    EventOutcome::Redraw => {
+                        input_dirty = true;
+                        if pending_input_at.is_none() {
+                            pending_input_at = Some(received_at);
+                        }
                     }
+                    EventOutcome::OpenEditor(path) => {
+                        open_in_editor(ui, writer, &path)?;
+                        input_dirty = true;
+                    }
+                    EventOutcome::Ignored => {}
                 }
-                EventOutcome::OpenEditor(path) => {
-                    open_in_editor(ui, writer, &path)?;
-                    input_dirty = true;
-                }
-                EventOutcome::Ignored => {}
             }
         }
     }
