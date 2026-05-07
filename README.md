@@ -67,6 +67,7 @@ tcloc --vcs git
 | `-j, --threads <N>`        | Worker threads (default: logical CPUs)                           |
 | `--max-file-size <MB>`     | Skip files larger than N MB (default: 100)                       |
 | `--exclude-dir <NAMES>`    | Comma-separated directory names to skip                          |
+| `--include-dir <NAMES>`    | Comma-separated top-level directory names to include             |
 | `--exclude-ext <EXTS>`     | Comma-separated file extensions to exclude                       |
 | `--include-ext <EXTS>`     | Comma-separated file extensions to include                       |
 | `--exclude-lang <LANGS>`   | Comma-separated languages to exclude                             |

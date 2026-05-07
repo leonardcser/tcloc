@@ -23,6 +23,7 @@ pub struct ScanConfig {
     pub threads: usize,
     pub max_file_size: u64,
     pub exclude_dirs: HashSet<String>,
+    pub include_dirs: HashSet<String>,
     pub exclude_exts: HashSet<String>,
     pub include_exts: HashSet<String>,
     pub exclude_langs: HashSet<String>,
@@ -81,10 +82,16 @@ fn scan_walk(cfg: &ScanConfig, tx: &Sender<ScanEvent>) {
             let path = entry.path();
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             if is_dir {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && cfg.exclude_dirs.contains(name)
-                {
-                    return WalkState::Skip;
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if cfg.exclude_dirs.contains(name) {
+                        return WalkState::Skip;
+                    }
+                    if entry.depth() == 1
+                        && !cfg.include_dirs.is_empty()
+                        && !cfg.include_dirs.contains(name)
+                    {
+                        return WalkState::Skip;
+                    }
                 }
                 return WalkState::Continue;
             }
@@ -106,6 +113,31 @@ fn scan_git(cfg: &ScanConfig, tx: &Sender<ScanEvent>) {
             eprintln!("tcloc: --vcs git: {}", e);
             return;
         }
+    };
+
+    let paths: Vec<PathBuf> = if cfg.include_dirs.is_empty() {
+        paths
+    } else {
+        paths
+            .into_iter()
+            .filter(|p| {
+                let Ok(rel) = p.strip_prefix(&cfg.root) else {
+                    return true;
+                };
+                let mut comps = rel.components();
+                let Some(first) = comps.next() else {
+                    return true;
+                };
+                if comps.next().is_none() {
+                    return true;
+                }
+                first
+                    .as_os_str()
+                    .to_str()
+                    .map(|s| cfg.include_dirs.contains(s))
+                    .unwrap_or(false)
+            })
+            .collect()
     };
 
     let paths = Arc::new(paths);
@@ -227,6 +259,19 @@ pub fn count(path: &Path, max_size: u64) -> Option<(u64, u64, Option<SystemTime>
 /// have skipped (wrong extension, excluded language, etc.). Returns the
 /// detected language if the path passes every filter.
 pub fn classify(path: &Path, cfg: &ScanConfig) -> Option<Lang> {
+    if !cfg.include_dirs.is_empty()
+        && let Ok(rel) = path.strip_prefix(&cfg.root)
+    {
+        let mut comps = rel.components();
+        if let Some(first) = comps.next()
+            && comps.next().is_some()
+        {
+            let name = first.as_os_str().to_str()?;
+            if !cfg.include_dirs.contains(name) {
+                return None;
+            }
+        }
+    }
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_lower = ext.to_ascii_lowercase();
         if !cfg.include_exts.is_empty() && !cfg.include_exts.contains(&ext_lower) {

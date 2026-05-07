@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub exclude_dir: Vec<String>,
 
+    /// Comma-separated top-level directory names to include (relative to PATH)
+    #[arg(long, value_delimiter = ',')]
+    pub include_dir: Vec<String>,
+
     /// Comma-separated file extensions to exclude (no leading dot)
     #[arg(long, value_delimiter = ',')]
     pub exclude_ext: Vec<String>,
@@ -102,6 +106,7 @@ impl Cli {
             threads: self.thread_count(),
             max_file_size: self.max_file_size.saturating_mul(1024 * 1024),
             exclude_dirs: self.exclude_dir.iter().cloned().collect(),
+            include_dirs: self.include_dir.iter().cloned().collect(),
             exclude_exts: self
                 .exclude_ext
                 .iter()
