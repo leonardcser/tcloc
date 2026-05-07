@@ -140,7 +140,7 @@ pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::
     let treemap_title = Line::new()
         .push(Span::styled(view_label, Style::new().fg(Color::White)))
         .push(Span::styled(
-            "(area = lines, color = language)",
+            "(area = lines, color = language) ",
             Style::new().fg(Color::DarkGrey),
         ));
     let mut items = vec![
@@ -159,7 +159,9 @@ pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::
                         .with_title(treemap_title),
                 ),
                 (
-                    Constraint::Length(34),
+                    // 33 cells of content (3 + 11 + 6 + 8 + 5) + 2 for
+                    // the side borders + 1 cell of right padding.
+                    Constraint::Length(36),
                     LayoutTree::leaf(PAINT_LEGEND)
                         .with_border(Border::SINGLE)
                         .with_title(" languages "),
@@ -1262,10 +1264,11 @@ fn render_legend(slice: &mut GridSlice<'_>, app: &mut App) {
     let scroll = app.legend_scroll;
     let ranked = app.ranked();
 
-    // Header row (slice-local row 1, since outer border is row 0).
+    // The slice is already inset by the layout-tree-painted border, so
+    // the header sits at the top row and content starts at column 0.
     let dim = Style::new().fg(Color::DarkGrey);
-    let header_y: u16 = 1;
-    let mut col: u16 = 1;
+    let header_y: u16 = 0;
+    let mut col: u16 = 0;
     col = put_str_clip(slice, col, header_y, &format!("{:<14}", "language"), dim);
     col = put_str_clip(slice, col, header_y, &format!("{:>6}", "files"), dim);
     col = put_str_clip(slice, col, header_y, &format!("{:>8}", "lines"), dim);
@@ -1274,10 +1277,10 @@ fn render_legend(slice: &mut GridSlice<'_>, app: &mut App) {
     for (row_idx, (lang_, stats)) in ranked.iter().skip(scroll).take(body_capacity).enumerate() {
         let pct = 100.0 * stats.lines as f64 / total as f64;
         let y: u16 = header_y + 1 + row_idx as u16;
-        if y >= slice.height() - 1 {
+        if y >= slice.height() {
             break;
         }
-        let mut col: u16 = 1;
+        let mut col: u16 = 0;
         col = put_str_clip(slice, col, y, "██ ", Style::new().fg(lang::color(*lang_)));
         col = put_str_clip(
             slice,
