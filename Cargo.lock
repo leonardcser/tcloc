@@ -722,6 +722,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smelt-buffer"
 version = "0.4.7"
+source = "git+https://github.com/leonardcser/smelt?rev=e9006242#e90062421f24f785cac3bc835558432a1361b6ae"
 dependencies = [
  "base64",
  "sha2",
@@ -731,6 +732,7 @@ dependencies = [
 [[package]]
 name = "smelt-term"
 version = "0.4.7"
+source = "git+https://github.com/leonardcser/smelt?rev=e9006242#e90062421f24f785cac3bc835558432a1361b6ae"
 dependencies = [
  "crossterm",
  "smelt-buffer",
