@@ -48,19 +48,24 @@ pub struct Cli {
     pub include_lang: Vec<String>,
 
     /// Follow symbolic links
-    #[arg(long)]
+    #[arg(short = 'L', long)]
     pub follow_links: bool,
 
     /// Include hidden files and directories
-    #[arg(long)]
+    #[arg(short = 'H', long)]
     pub hidden: bool,
 
     /// Do not honor .gitignore / .ignore files
-    #[arg(long)]
+    #[arg(short = 'I', long)]
     pub no_ignore: bool,
 
+    /// Watch the scan root and apply incremental updates when files
+    /// change. Off by default — opt in with --watch.
+    #[arg(short = 'w', long)]
+    pub watch: bool,
+
     /// Show live performance HUD and print a benchmark report on exit
-    #[arg(long)]
+    #[arg(short = 'b', long)]
     pub bench: bool,
 
     /// Auto-exit N milliseconds after the scan finishes (useful with --bench)

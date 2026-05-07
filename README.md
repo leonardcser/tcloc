@@ -59,20 +59,21 @@ tcloc --vcs git
 
 ## Options
 
-| Flag                     | Description                                                      |
-| ------------------------ | ---------------------------------------------------------------- |
-| `--vcs <VCS>`            | Use a VCS to enumerate files (only `git` supported)              |
-| `-j, --threads <N>`      | Worker threads (default: logical CPUs)                           |
-| `--max-file-size <MB>`   | Skip files larger than N MB (default: 100)                       |
-| `--exclude-dir <NAMES>`  | Comma-separated directory names to skip                          |
-| `--exclude-ext <EXTS>`   | Comma-separated file extensions to exclude                       |
-| `--include-ext <EXTS>`   | Comma-separated file extensions to include                       |
-| `--exclude-lang <LANGS>` | Comma-separated languages to exclude                             |
-| `--include-lang <LANGS>` | Comma-separated languages to include                             |
-| `--hidden`               | Include hidden files and directories                             |
-| `--no-ignore`            | Do not honor `.gitignore` / `.ignore`                            |
-| `--follow-links`         | Follow symbolic links                                            |
-| `--bench`                | Show a live performance HUD and print a benchmark report on exit |
-| `--auto-exit-ms <MS>`    | Exit N ms after the scan finishes (useful with `--bench`)        |
+| Flag                       | Description                                                      |
+| -------------------------- | ---------------------------------------------------------------- |
+| `--vcs <VCS>`              | Use a VCS to enumerate files (only `git` supported)              |
+| `-j, --threads <N>`        | Worker threads (default: logical CPUs)                           |
+| `--max-file-size <MB>`     | Skip files larger than N MB (default: 100)                       |
+| `--exclude-dir <NAMES>`    | Comma-separated directory names to skip                          |
+| `--exclude-ext <EXTS>`     | Comma-separated file extensions to exclude                       |
+| `--include-ext <EXTS>`     | Comma-separated file extensions to include                       |
+| `--exclude-lang <LANGS>`   | Comma-separated languages to exclude                             |
+| `--include-lang <LANGS>`   | Comma-separated languages to include                             |
+| `-H, --hidden`             | Include hidden files and directories                             |
+| `-I, --no-ignore`          | Do not honor `.gitignore` / `.ignore`                            |
+| `-L, --follow-links`       | Follow symbolic links                                            |
+| `-w, --watch`              | Watch the scan root and apply incremental updates on file change |
+| `-b, --bench`              | Show a live performance HUD and print a benchmark report on exit |
+| `--auto-exit-ms <MS>`      | Exit N ms after the scan finishes (useful with `--bench`)        |
 
 Run `tcloc --help` for the full list.

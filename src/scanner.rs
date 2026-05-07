@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::time::SystemTime;
 
 use ignore::{WalkBuilder, WalkState};
 
@@ -37,6 +38,7 @@ pub enum ScanEvent {
         lang: Lang,
         lines: u64,
         bytes: u64,
+        mtime: Option<SystemTime>,
         count_nanos: u64,
     },
     Done {
@@ -171,30 +173,12 @@ fn process_file(
     tx: &Sender<ScanEvent>,
 ) -> Result<(), std::sync::mpsc::SendError<ScanEvent>> {
     let _g = crate::perf::begin("scan.process_file");
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_ascii_lowercase();
-        if !cfg.include_exts.is_empty() && !cfg.include_exts.contains(&ext_lower) {
-            return Ok(());
-        }
-        if cfg.exclude_exts.contains(&ext_lower) {
-            return Ok(());
-        }
-    } else if !cfg.include_exts.is_empty() {
-        return Ok(());
-    }
-
-    let Some(lang) = lang::detect(path) else {
+    let Some(lang) = classify(path, cfg) else {
         return Ok(());
     };
-    if !cfg.include_langs.is_empty() && !cfg.include_langs.contains(lang.0) {
-        return Ok(());
-    }
-    if cfg.exclude_langs.contains(lang.0) {
-        return Ok(());
-    }
 
     let t0 = std::time::Instant::now();
-    let Some((lines, bytes)) = count(path, cfg.max_file_size) else {
+    let Some((lines, bytes, mtime)) = count(path, cfg.max_file_size) else {
         return Ok(());
     };
     let count_nanos = t0.elapsed().as_nanos() as u64;
@@ -204,6 +188,7 @@ fn process_file(
         lang,
         lines,
         bytes,
+        mtime,
         count_nanos,
     })
 }
@@ -212,7 +197,9 @@ thread_local! {
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn count(path: &Path, max_size: u64) -> Option<(u64, u64)> {
+/// Open + line-count a single file. Public so the watcher can re-use
+/// the exact same logic for incremental updates.
+pub fn count(path: &Path, max_size: u64) -> Option<(u64, u64, Option<SystemTime>)> {
     let _g = crate::perf::begin("scan.count");
     let file = std::fs::File::open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -220,8 +207,9 @@ fn count(path: &Path, max_size: u64) -> Option<(u64, u64)> {
     if max_size > 0 && len > max_size {
         return None;
     }
+    let mtime = meta.modified().ok();
     if len == 0 {
-        return Some((0, 0));
+        return Some((0, 0, mtime));
     }
     READ_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -230,8 +218,34 @@ fn count(path: &Path, max_size: u64) -> Option<(u64, u64)> {
         use std::io::Read;
         let mut f = file;
         f.read_to_end(&mut buf).ok()?;
-        count_bytes(&buf).map(|lines| (lines, buf.len() as u64))
+        count_bytes(&buf).map(|lines| (lines, buf.len() as u64, mtime))
     })
+}
+
+/// Same filter logic the scanner applies inside `process_file`, exposed
+/// so the watcher can reject events on files the initial scan would
+/// have skipped (wrong extension, excluded language, etc.). Returns the
+/// detected language if the path passes every filter.
+pub fn classify(path: &Path, cfg: &ScanConfig) -> Option<Lang> {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_ascii_lowercase();
+        if !cfg.include_exts.is_empty() && !cfg.include_exts.contains(&ext_lower) {
+            return None;
+        }
+        if cfg.exclude_exts.contains(&ext_lower) {
+            return None;
+        }
+    } else if !cfg.include_exts.is_empty() {
+        return None;
+    }
+    let lang = lang::detect(path)?;
+    if !cfg.include_langs.is_empty() && !cfg.include_langs.contains(lang.0) {
+        return None;
+    }
+    if cfg.exclude_langs.contains(lang.0) {
+        return None;
+    }
+    Some(lang)
 }
 
 fn count_bytes(buf: &[u8]) -> Option<u64> {

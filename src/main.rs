@@ -10,6 +10,7 @@ mod scanner;
 mod tree;
 mod treemap;
 mod ui;
+mod watcher;
 
 use std::io::{self, BufWriter, Stdout};
 use std::sync::mpsc;
@@ -32,6 +33,7 @@ use crate::alloc_track::CountingAllocator;
 use crate::app::{App, NavDir, TileTarget};
 use crate::cli::Cli;
 use crate::scanner::ScanEvent;
+use crate::watcher::{CachedMeta, MetaCache, WatchEvent};
 
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
@@ -41,11 +43,23 @@ fn main() -> io::Result<()> {
     let root = cli.path.canonicalize().unwrap_or_else(|_| cli.path.clone());
     let threads = cli.thread_count();
     let bench_enabled = cli.bench;
+    let watch_enabled = cli.watch;
     let auto_exit_ms = cli.auto_exit_ms;
     let bench_vcs = cli.vcs.clone();
+    let scan_cfg = cli.scan_config(root.clone());
 
     let (tx, rx) = mpsc::channel::<ScanEvent>();
-    scanner::spawn(cli.scan_config(root.clone()), tx);
+    scanner::spawn(scan_cfg.clone(), tx);
+
+    // Watch channel + shared metadata cache. The watcher is spawned
+    // after the initial scan finishes (see `run`) so it doesn't race
+    // the walker on the same tree. The cache is filled here as scan
+    // events arrive, so by the time the watcher comes online it
+    // already knows every file's `(mtime, size)` and can short-circuit
+    // spurious events from the first keystroke.
+    let (watch_tx, watch_rx) = mpsc::channel::<WatchEvent>();
+    let meta_cache: MetaCache =
+        std::sync::Arc::new(std::sync::Mutex::new(hashbrown::HashMap::new()));
 
     if bench_enabled {
         perf::enable();
@@ -53,6 +67,9 @@ fn main() -> io::Result<()> {
 
     let mut app = App::new(root);
     app.bench.enabled = bench_enabled;
+    // Mark watch mode at startup so the status badge skips the "DONE"
+    // intermediate state and goes straight from SCANNING to WATCHING.
+    app.watching = watch_enabled;
 
     let scan_started = Instant::now();
     let alloc_baseline = alloc_track::snapshot();
@@ -68,7 +85,17 @@ fn main() -> io::Result<()> {
     let buffered = io::BufWriter::with_capacity(256 * 1024, stdout);
     let mut terminal = Terminal::new(CrosstermBackend::new(buffered))?;
 
-    let res = run(&mut terminal, app, rx, auto_exit_ms);
+    let res = run(
+        &mut terminal,
+        app,
+        rx,
+        watch_rx,
+        watch_tx,
+        meta_cache,
+        scan_cfg,
+        watch_enabled,
+        auto_exit_ms,
+    );
 
     disable_raw_mode()?;
     execute!(
@@ -93,10 +120,16 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     mut app: App,
     rx: mpsc::Receiver<ScanEvent>,
+    watch_rx: mpsc::Receiver<WatchEvent>,
+    watch_tx: mpsc::Sender<WatchEvent>,
+    meta_cache: MetaCache,
+    scan_cfg: scanner::ScanConfig,
+    watch_enabled: bool,
     auto_exit_ms: Option<u64>,
 ) -> io::Result<App> {
     let base_interval = Duration::from_millis(33);
@@ -110,6 +143,18 @@ fn run(
     let mut scan_dirty = false;
     let mut done_at: Option<Instant> = None;
     let mut pending_input_at: Option<Instant> = None;
+    // Live debouncer handle. Held for the program lifetime — dropping
+    // it stops the watcher. `None` until the initial scan finishes.
+    let mut _watcher_handle: Option<
+        notify_debouncer_full::Debouncer<
+            notify::RecommendedWatcher,
+            notify_debouncer_full::RecommendedCache,
+        >,
+    > = None;
+    // Distinct from `_watcher_handle.is_none()`: we tried once and
+    // gave up. Without this we'd retry on every subsequent drain that
+    // returns true, spamming logs and CPU.
+    let mut watcher_tried = false;
 
     loop {
         if let (Some(ms), Some(t)) = (auto_exit_ms, done_at)
@@ -118,7 +163,35 @@ fn run(
             return Ok(app);
         }
 
-        if drain_events(&rx, &mut app, &mut done_at, drain_budget) {
+        if drain_events(&rx, &mut app, &meta_cache, &mut done_at, drain_budget) {
+            scan_dirty = true;
+            // Bring the watcher online the first time we see a Done,
+            // but only when --watch is set. The cache is already
+            // populated with every file's (mtime, size), so editor
+            // saves on day-old files don't trigger redundant
+            // re-counts.
+            if watch_enabled && app.done && !watcher_tried {
+                watcher_tried = true;
+                _watcher_handle = watcher::spawn(
+                    scan_cfg.clone(),
+                    watch_tx.clone(),
+                    std::sync::Arc::clone(&meta_cache),
+                );
+                // If the watcher fails to spawn (e.g. inotify limits on
+                // Linux), drop the WATCHING badge back to DONE so the
+                // user isn't lied to about live updates being on.
+                if _watcher_handle.is_none() {
+                    app.watching = false;
+                }
+            }
+        }
+        if drain_watch_events(&watch_rx, &mut app, &meta_cache) {
+            scan_dirty = true;
+        }
+        // While any pulse is mid-fade, keep redrawing on the cadence so
+        // the animation actually animates. `gc_pulses` keeps the map
+        // bounded under sustained file churn.
+        if app.has_active_pulses() {
             scan_dirty = true;
         }
 
@@ -204,6 +277,7 @@ fn open_in_editor(
 fn drain_events(
     rx: &mpsc::Receiver<ScanEvent>,
     app: &mut App,
+    meta: &MetaCache,
     done_at: &mut Option<Instant>,
     budget: Duration,
 ) -> bool {
@@ -216,8 +290,12 @@ fn drain_events(
                 lang,
                 lines,
                 bytes,
+                mtime,
                 count_nanos,
             }) => {
+                if let Ok(mut m) = meta.lock() {
+                    m.insert(path.clone(), CachedMeta { mtime, bytes });
+                }
                 app.record(path, lang, lines, bytes, count_nanos);
                 changed = true;
             }
@@ -236,6 +314,45 @@ fn drain_events(
         }
         if start.elapsed() > budget {
             return changed;
+        }
+    }
+}
+
+/// Drain whatever the watcher has produced. Each batch ends with a
+/// `BatchDone` marker so the caller can collapse "20 files just got
+/// touched by a save" into a single redraw without flashing.
+fn drain_watch_events(rx: &mpsc::Receiver<WatchEvent>, app: &mut App, meta: &MetaCache) -> bool {
+    let mut changed = false;
+    loop {
+        match rx.try_recv() {
+            Ok(WatchEvent::Upsert {
+                path,
+                lang,
+                lines,
+                bytes,
+                mtime,
+            }) => {
+                if let Ok(mut m) = meta.lock() {
+                    m.insert(path.clone(), CachedMeta { mtime, bytes });
+                }
+                app.watch_upsert(path, lang, lines, bytes);
+                changed = true;
+            }
+            Ok(WatchEvent::Remove { path }) => {
+                if let Ok(mut m) = meta.lock() {
+                    m.remove(&path);
+                }
+                app.watch_remove(&path);
+                changed = true;
+            }
+            Ok(WatchEvent::BatchDone) => {
+                // Sentinel only: lets us bound the loop per batch
+                // rather than starving input handling on huge bursts.
+                return changed;
+            }
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                return changed;
+            }
         }
     }
 }

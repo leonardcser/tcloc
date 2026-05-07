@@ -9,9 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{App, TileTarget, View};
 use crate::bitmap_font;
-use crate::format::{
-    fmt_bytes_short, fmt_compact, fmt_int, fmt_pct, truncate, truncate_left,
-};
+use crate::format::{fmt_bytes_short, fmt_compact, fmt_int, fmt_pct, truncate, truncate_left};
 use crate::lang;
 use crate::tree::{FolderNode, Node};
 use crate::treemap::{self, Item};
@@ -27,6 +25,21 @@ const BITMAP_MIN_TERMINAL_H: u16 = 36;
 
 fn bitmap_enabled(area: Rect) -> bool {
     area.width >= BITMAP_MIN_TERMINAL_W && area.height >= BITMAP_MIN_TERMINAL_H
+}
+
+/// Compose the tile background colour from selection + pulse. Selected
+/// tiles get a flat brightness boost; pulses fade from `PULSE_PEAK` to
+/// 0 over `PULSE_DURATION` (handled by `App::tile_pulse`). Both are
+/// stacked, with `brighten` clamping the combined amount.
+fn tile_color(base: Color, selected: bool, pulse: f32) -> Color {
+    let mut c = base;
+    if selected {
+        c = brighten(c, 0.4);
+    }
+    if pulse > 0.0 {
+        c = brighten(c, pulse as f64);
+    }
+    c
 }
 
 // Per-scale minimum render-area size in cells. The largest scale whose
@@ -133,6 +146,10 @@ struct TileItem {
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let _g = crate::perf::begin("ui.render");
+    // Drop expired pulses up front: keeps the per-tile lookup small
+    // and avoids paying for stale animation state for the rest of
+    // the session.
+    app.gc_pulses();
     let area = f.area();
     let mut constraints = vec![Constraint::Length(2), Constraint::Min(0)];
     if app.bench.enabled {
@@ -165,10 +182,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let _g = crate::perf::begin("ui.header");
-    let (status_text, status_bg) = if app.done {
-        (" DONE ", Color::Green)
-    } else {
+    let (status_text, status_bg) = if !app.done {
         (" SCANNING ", Color::Yellow)
+    } else if app.watching {
+        (" WATCHING ", Color::Red)
+    } else {
+        (" DONE ", Color::Green)
     };
     let stat_items = [
         format!("{} files", fmt_compact(app.total_files)),
@@ -372,8 +391,6 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
             app.items_dirty = false;
         }
         if buf.is_empty() {
-            let msg = Paragraph::new("scanning…").style(Style::default().fg(Color::DarkGray));
-            f.render_widget(msg, inner);
             return;
         }
 
@@ -410,36 +427,27 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
                     //     `bitmap_enabled(inner)`.
                     let _g = crate::perf::begin("ui.bitmap_labels");
                     if bitmap_enabled(inner) {
-                    let max_scale = max_label_scale(inner);
-                    for (i, (r, idx)) in visible.iter().enumerate() {
-                        let item = &buf[*idx];
-                        let Some(scale) =
-                            pick_label_scale(&item.name, r.width, r.height, max_scale)
-                        else {
-                            continue;
-                        };
-                        let bg = if app.selected.as_ref() == Some(&item.target) {
-                            brighten(item.color, 0.4)
-                        } else {
-                            item.color
-                        };
-                        let fg = readable_fg(bg);
-                        let label_w = bitmap_font::label_width(&item.name, scale);
-                        let label_h = bitmap_font::label_height(scale);
-                        let x0 = r.x as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
-                        let y0 = r.y as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32;
-                        bitmap_font::paint(
-                            &mut grid,
-                            cols,
-                            sub_rows,
-                            x0,
-                            y0,
-                            &item.name,
-                            fg,
-                            scale,
-                        );
-                        scaled_painted[i] = true;
-                    }
+                        let max_scale = max_label_scale(inner);
+                        for (i, (r, idx)) in visible.iter().enumerate() {
+                            let item = &buf[*idx];
+                            let Some(scale) =
+                                pick_label_scale(&item.name, r.width, r.height, max_scale)
+                            else {
+                                continue;
+                            };
+                            let selected = app.selected.as_ref() == Some(&item.target);
+                            let pulse = app.tile_pulse(&item.target);
+                            let bg = tile_color(item.color, selected, pulse);
+                            let fg = readable_fg(bg);
+                            let label_w = bitmap_font::label_width(&item.name, scale);
+                            let label_h = bitmap_font::label_height(scale);
+                            let x0 = r.x as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
+                            let y0 = r.y as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32;
+                            bitmap_font::paint(
+                                &mut grid, cols, sub_rows, x0, y0, &item.name, fg, scale,
+                            );
+                            scaled_painted[i] = true;
+                        }
                     }
                     drop(_g);
 
@@ -448,14 +456,7 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
 
                     // 4. Overlay text labels on tiles that didn't get a
                     //    bitmap label and still fit a character row.
-                    overlay_labels(
-                        f.buffer_mut(),
-                        inner,
-                        &visible,
-                        &buf,
-                        app,
-                        &scaled_painted,
-                    );
+                    overlay_labels(f.buffer_mut(), inner, &visible, &buf, app, &scaled_painted);
                 });
             });
         });
@@ -472,8 +473,6 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
 /// recorded in the same order so deepest-tile wins on click.
 fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
     if app.current_folder().total_files == 0 {
-        let msg = Paragraph::new("scanning…").style(Style::default().fg(Color::DarkGray));
-        f.render_widget(msg, inner);
         return;
     }
     let cols = inner.width as usize;
@@ -511,180 +510,170 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
         // overlay loop knows to skip them. Reused across frames to avoid
         // a per-frame allocation when the tree is large.
         SCALED_PAINTED_BUF.with(|sp| {
-        let mut scaled_painted = sp.borrow_mut();
-        scaled_painted.clear();
-        scaled_painted.resize(nodes.len(), false);
+            let mut scaled_painted = sp.borrow_mut();
+            scaled_painted.clear();
+            scaled_painted.resize(nodes.len(), false);
 
-        GRID_BUF.with(|g| {
-            let mut grid = g.borrow_mut();
-            grid.clear();
-            grid.resize(cols * sub_rows, None);
-            for node in nodes.iter() {
-                let color = if app.selected.as_ref() == Some(&node.target) {
-                    brighten(node.color, 0.4)
-                } else {
-                    node.color
-                };
-                let r = node.rect;
-                let sx_end = (r.x + r.width).min(cols as u16);
-                let sy_end = (r.y + r.height).min(sub_rows as u16);
-                for sy in r.y..sy_end {
-                    let row_base = sy as usize * cols;
-                    for sx in r.x..sx_end {
-                        grid[row_base + sx as usize] = Some(color);
+            GRID_BUF.with(|g| {
+                let mut grid = g.borrow_mut();
+                grid.clear();
+                grid.resize(cols * sub_rows, None);
+                for node in nodes.iter() {
+                    let selected = app.selected.as_ref() == Some(&node.target);
+                    let pulse = app.tile_pulse(&node.target);
+                    let color = tile_color(node.color, selected, pulse);
+                    let r = node.rect;
+                    let sx_end = (r.x + r.width).min(cols as u16);
+                    let sy_end = (r.y + r.height).min(sub_rows as u16);
+                    for sy in r.y..sy_end {
+                        let row_base = sy as usize * cols;
+                        for sx in r.x..sx_end {
+                            grid[row_base + sx as usize] = Some(color);
+                        }
                     }
                 }
-            }
-            // Scaled bitmap labels: paint glyph pixels into the same grid
-            // before compositing. The half-block emitter below renders them
-            // as text on top of the tile colour.
-            //
-            // - Files: pick the largest scale that fits the file's interior
-            //   dynamically; centre the glyph block.
-            // - Folders: use the scale chosen at build time, paint into the
-            //   reserved band at the top of the folder rect. Children's
-            //   rects start below the band so they don't disturb the
-            //   glyph pixels.
-            //
-            // The whole loop is skipped on small terminals via the
-            // `bitmap_on` gate computed once per frame.
-            if bitmap_on {
-            let max_scale = max_label_scale(inner);
+                // Scaled bitmap labels: paint glyph pixels into the same grid
+                // before compositing. The half-block emitter below renders them
+                // as text on top of the tile colour.
+                //
+                // - Files: pick the largest scale that fits the file's interior
+                //   dynamically; centre the glyph block.
+                // - Folders: use the scale chosen at build time, paint into the
+                //   reserved band at the top of the folder rect. Children's
+                //   rects start below the band so they don't disturb the
+                //   glyph pixels.
+                //
+                // The whole loop is skipped on small terminals via the
+                // `bitmap_on` gate computed once per frame.
+                if bitmap_on {
+                    let max_scale = max_label_scale(inner);
+                    for (i, node) in nodes.iter().enumerate() {
+                        let r = node.rect;
+                        let selected = app.selected.as_ref() == Some(&node.target);
+                        let pulse = app.tile_pulse(&node.target);
+                        let bg = tile_color(node.color, selected, pulse);
+                        let fg = readable_fg(bg);
+                        // Folders: use the scale chosen at build time, paint into
+                        //   the reserved band at the top of the rect.
+                        // Files: pick the largest fitting scale per frame and
+                        //   centre the glyph block.
+                        let (scale, y0) = if node.is_folder {
+                            let Some(s) = node.bitmap_scale else { continue };
+                            (s, r.y as i32 + NESTED_BAND_PAD_SUBROWS as i32)
+                        } else {
+                            let Some(s) =
+                                pick_label_scale(&node.name, r.width, r.height, max_scale)
+                            else {
+                                continue;
+                            };
+                            let label_h = bitmap_font::label_height(s);
+                            (
+                                s,
+                                r.y as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32,
+                            )
+                        };
+                        let label_w = bitmap_font::label_width(&node.name, scale);
+                        let x0 = r.x as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
+                        bitmap_font::paint(
+                            &mut grid, cols, sub_rows, x0, y0, &node.name, fg, scale,
+                        );
+                        scaled_painted[i] = true;
+                    }
+                }
+                composite_halfblocks(f.buffer_mut(), inner, &grid, cols);
+            });
+
+            // Labels: skip when there isn't a full character row inside the tile.
+            let buf = f.buffer_mut();
             for (i, node) in nodes.iter().enumerate() {
+                if scaled_painted[i] {
+                    continue;
+                }
+                if node.label_rows == 0 {
+                    continue;
+                }
                 let r = node.rect;
-                let bg = if app.selected.as_ref() == Some(&node.target) {
-                    brighten(node.color, 0.4)
-                } else {
-                    node.color
-                };
+                let y_start = (r.y as i32 + 1) / 2;
+                let y_end = (r.y as i32 + r.height as i32) / 2;
+                if y_end <= y_start {
+                    continue;
+                }
+                let abs_x = inner.x as i32 + r.x as i32;
+                let abs_y = inner.y as i32 + y_start;
+                let abs_w = r.width as i32;
+                let abs_h = y_end - y_start;
+                if abs_w < 3 || abs_h < 1 {
+                    continue;
+                }
+                // For folders, label_rows is the cap that matches the reserved
+                // band; for files, label_rows is just the maximum we'd ever
+                // write. Both clamp to the actual character rows inside the
+                // tile (`abs_h`) so we never overflow the visible area.
+                let max_rows = (node.label_rows as i32).min(abs_h);
+                if max_rows < 1 {
+                    continue;
+                }
+                let selected = app.selected.as_ref() == Some(&node.target);
+                let pulse = app.tile_pulse(&node.target);
+                let bg = tile_color(node.color, selected, pulse);
                 let fg = readable_fg(bg);
-                // Folders: use the scale chosen at build time, paint into
-                //   the reserved band at the top of the rect.
-                // Files: pick the largest fitting scale per frame and
-                //   centre the glyph block.
-                let (scale, y0) = if node.is_folder {
-                    let Some(s) = node.bitmap_scale else { continue };
-                    (s, r.y as i32 + NESTED_BAND_PAD_SUBROWS as i32)
+                let primary_mod = if node.is_folder {
+                    Modifier::BOLD
                 } else {
-                    let Some(s) =
-                        pick_label_scale(&node.name, r.width, r.height, max_scale)
-                    else {
-                        continue;
-                    };
-                    let label_h = bitmap_font::label_height(s);
-                    (s, r.y as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32)
+                    Modifier::empty()
                 };
-                let label_w = bitmap_font::label_width(&node.name, scale);
-                let x0 = r.x as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
-                bitmap_font::paint(
-                    &mut grid,
-                    cols,
-                    sub_rows,
-                    x0,
-                    y0,
-                    &node.name,
-                    fg,
-                    scale,
-                );
-                scaled_painted[i] = true;
-            }
-            }
-            composite_halfblocks(f.buffer_mut(), inner, &grid, cols);
-        });
-
-        // Labels: skip when there isn't a full character row inside the tile.
-        let buf = f.buffer_mut();
-        for (i, node) in nodes.iter().enumerate() {
-            if scaled_painted[i] {
-                continue;
-            }
-            if node.label_rows == 0 {
-                continue;
-            }
-            let r = node.rect;
-            let y_start = (r.y as i32 + 1) / 2;
-            let y_end = (r.y as i32 + r.height as i32) / 2;
-            if y_end <= y_start {
-                continue;
-            }
-            let abs_x = inner.x as i32 + r.x as i32;
-            let abs_y = inner.y as i32 + y_start;
-            let abs_w = r.width as i32;
-            let abs_h = y_end - y_start;
-            if abs_w < 3 || abs_h < 1 {
-                continue;
-            }
-            // For folders, label_rows is the cap that matches the reserved
-            // band; for files, label_rows is just the maximum we'd ever
-            // write. Both clamp to the actual character rows inside the
-            // tile (`abs_h`) so we never overflow the visible area.
-            let max_rows = (node.label_rows as i32).min(abs_h);
-            if max_rows < 1 {
-                continue;
-            }
-            let bg = if app.selected.as_ref() == Some(&node.target) {
-                brighten(node.color, 0.4)
-            } else {
-                node.color
-            };
-            let fg = readable_fg(bg);
-            let primary_mod = if node.is_folder {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            };
-            write_row(
-                buf,
-                &truncate(&node.name, abs_w as usize),
-                fg,
-                primary_mod,
-                abs_x,
-                abs_y,
-                abs_w,
-            );
-            // Subtitle rows only render when the band reserved enough
-            // space *and* the unmodified text fits the tile width.
-            if max_rows >= 2 && (node.subtitle1.chars().count() as i32) <= abs_w {
                 write_row(
                     buf,
-                    &node.subtitle1,
+                    &truncate(&node.name, abs_w as usize),
                     fg,
-                    Modifier::empty(),
+                    primary_mod,
                     abs_x,
-                    abs_y + 1,
+                    abs_y,
                     abs_w,
                 );
+                // Subtitle rows only render when the band reserved enough
+                // space *and* the unmodified text fits the tile width.
+                if max_rows >= 2 && (node.subtitle1.chars().count() as i32) <= abs_w {
+                    write_row(
+                        buf,
+                        &node.subtitle1,
+                        fg,
+                        Modifier::empty(),
+                        abs_x,
+                        abs_y + 1,
+                        abs_w,
+                    );
+                }
+                if max_rows >= 3 && !node.subtitle2.is_empty() {
+                    write_row(
+                        buf,
+                        &truncate(&node.subtitle2, abs_w as usize),
+                        fg,
+                        Modifier::DIM,
+                        abs_x,
+                        abs_y + 2,
+                        abs_w,
+                    );
+                }
             }
-            if max_rows >= 3 && !node.subtitle2.is_empty() {
-                write_row(
-                    buf,
-                    &truncate(&node.subtitle2, abs_w as usize),
-                    fg,
-                    Modifier::DIM,
-                    abs_x,
-                    abs_y + 2,
-                    abs_w,
-                );
-            }
-        }
 
-        // Hit regions in node order: parents first, children last. App.hit()
-        // iterates in reverse so the deepest tile under the cursor wins.
-        for node in nodes.iter() {
-            let r = node.rect;
-            let cy0 = r.y as i32 / 2;
-            let cy1 = (r.y as i32 + r.height as i32 + 1) / 2;
-            let cell_rect = Rect {
-                x: (inner.x as i32 + r.x as i32).max(0) as u16,
-                y: (inner.y as i32 + cy0).max(0) as u16,
-                width: r.width,
-                height: (cy1 - cy0).max(0) as u16,
-            };
-            if cell_rect.width == 0 || cell_rect.height == 0 {
-                continue;
+            // Hit regions in node order: parents first, children last. App.hit()
+            // iterates in reverse so the deepest tile under the cursor wins.
+            for node in nodes.iter() {
+                let r = node.rect;
+                let cy0 = r.y as i32 / 2;
+                let cy1 = (r.y as i32 + r.height as i32 + 1) / 2;
+                let cell_rect = Rect {
+                    x: (inner.x as i32 + r.x as i32).max(0) as u16,
+                    y: (inner.y as i32 + cy0).max(0) as u16,
+                    width: r.width,
+                    height: (cy1 - cy0).max(0) as u16,
+                };
+                if cell_rect.width == 0 || cell_rect.height == 0 {
+                    continue;
+                }
+                app.last_tiles.push((cell_rect, node.target.clone()));
             }
-            app.last_tiles.push((cell_rect, node.target.clone()));
-        }
         });
     });
 }
@@ -697,7 +686,16 @@ fn build_nested(
     max_scale: u16,
     out: &mut Vec<NestedNode>,
 ) {
-    build_nested_at(folder, rect, base_path, 0, 0, bitmap_enabled, max_scale, out);
+    build_nested_at(
+        folder,
+        rect,
+        base_path,
+        0,
+        0,
+        bitmap_enabled,
+        max_scale,
+        out,
+    );
 }
 
 /// Sub-rows the folder reserves at the bottom of its rect for children
@@ -780,7 +778,11 @@ fn build_nested_at(
                 Node::File(f) => f.lines,
                 Node::Folder(s) => s.total_lines,
             };
-            if v == 0 { None } else { Some((name.as_str(), child, v)) }
+            if v == 0 {
+                None
+            } else {
+                Some((name.as_str(), child, v))
+            }
         })
         .collect();
     entries.sort_by_key(|e| std::cmp::Reverse(e.2));
@@ -969,8 +971,7 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
                     tiles = treemap::squarify(&tm_items, layout_area);
                     let before = excluded_count;
                     for t in &tiles {
-                        if (t.rect.width < MIN_TILE_SUBCELLS
-                            || t.rect.height < MIN_TILE_SUBCELLS)
+                        if (t.rect.width < MIN_TILE_SUBCELLS || t.rect.height < MIN_TILE_SUBCELLS)
                             && !excluded[t.data]
                         {
                             excluded[t.data] = true;
@@ -981,8 +982,9 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
                         break;
                     }
                 }
-                tiles
-                    .retain(|t| t.rect.width >= MIN_TILE_SUBCELLS && t.rect.height >= MIN_TILE_SUBCELLS);
+                tiles.retain(|t| {
+                    t.rect.width >= MIN_TILE_SUBCELLS && t.rect.height >= MIN_TILE_SUBCELLS
+                });
                 (tiles, iters, excluded_count, t0)
             })
         })
@@ -1036,11 +1038,8 @@ fn rasterize_tiles(
 
         let item = &items[tile.data];
         let selected = app.selected.as_ref() == Some(&item.target);
-        let color = if selected {
-            brighten(item.color, 0.4)
-        } else {
-            item.color
-        };
+        let pulse = app.tile_pulse(&item.target);
+        let color = tile_color(item.color, selected, pulse);
 
         let sx_end = (r.x + r.width).min(cols as u16);
         let sy_end = (r.y + r.height).min(sub_rows as u16);
@@ -1117,11 +1116,8 @@ fn overlay_labels(
         }
         let item = &items[*idx];
         let selected = app.selected.as_ref() == Some(&item.target);
-        let bg = if selected {
-            brighten(item.color, 0.4)
-        } else {
-            item.color
-        };
+        let pulse = app.tile_pulse(&item.target);
+        let bg = tile_color(item.color, selected, pulse);
         write_label(buf, item, bg, abs_x0, abs_y0, abs_w, abs_h);
     }
     if app.bench.enabled {
@@ -1171,7 +1167,15 @@ fn write_label(buf: &mut Buffer, item: &TileItem, bg: Color, x: i32, y: i32, w: 
         return;
     }
     let fg = readable_fg(bg);
-    write_row(buf, &truncate(&item.name, w as usize), fg, Modifier::BOLD, x, y, w);
+    write_row(
+        buf,
+        &truncate(&item.name, w as usize),
+        fg,
+        Modifier::BOLD,
+        x,
+        y,
+        w,
+    );
     if h >= 2 && (item.subtitle1.chars().count() as i32) <= w {
         write_row(buf, &item.subtitle1, fg, Modifier::empty(), x, y + 1, w);
     }

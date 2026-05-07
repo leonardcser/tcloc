@@ -1,11 +1,17 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
 use crate::lang::Lang;
-use crate::tree::{self, FolderNode, Node};
+use crate::tree::{self, FolderNode, Node, UpsertOutcome};
+
+/// How long a "file just changed" pulse stays visible. The renderer
+/// brightens the tile by a factor that fades from `PULSE_PEAK` at t=0
+/// to 0 at t=`PULSE_DURATION`, using ease-out.
+pub const PULSE_DURATION: Duration = Duration::from_millis(700);
+const PULSE_PEAK: f32 = 0.6;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LangStats {
@@ -123,6 +129,14 @@ pub struct App {
     pub last_path: Option<PathBuf>,
     pub done: bool,
     pub finished_at: Option<Instant>,
+    /// True when the watcher is live (i.e. user passed --watch and the
+    /// initial scan has finished). Drives the "WATCHING" status badge
+    /// in the header.
+    pub watching: bool,
+    /// Files that recently changed via the watcher, with the instant the
+    /// pulse should fade from. Cleaned up lazily on render so we don't
+    /// pay for them when nothing's pulsing.
+    pub pulses: HashMap<PathBuf, Instant>,
 }
 
 impl App {
@@ -149,6 +163,8 @@ impl App {
             last_path: None,
             done: false,
             finished_at: None,
+            watching: false,
+            pulses: HashMap::new(),
         }
     }
 
@@ -163,23 +179,145 @@ impl App {
                 self.bench.min_count_nanos = count_nanos;
             }
         }
-        self.record_inner(path, lang, lines, bytes);
+        self.upsert_inner(path, lang, lines, bytes, false);
     }
 
-    fn record_inner(&mut self, path: PathBuf, lang: Lang, lines: u64, bytes: u64) {
-        let s = self.stats.entry(lang).or_default();
-        s.files += 1;
-        s.lines += lines;
-        s.bytes += bytes;
-        self.total_files += 1;
-        self.total_lines += lines;
-        self.total_bytes += bytes;
+    /// Watch-driven update: same math as `record`, plus a pulse so the
+    /// tile flashes briefly. Used both for genuinely new files and for
+    /// re-counted modifications.
+    pub fn watch_upsert(&mut self, path: PathBuf, lang: Lang, lines: u64, bytes: u64) {
+        self.upsert_inner(path, lang, lines, bytes, true);
+    }
+
+    fn upsert_inner(&mut self, path: PathBuf, lang: Lang, lines: u64, bytes: u64, pulse: bool) {
+        let outcome = tree::upsert(&mut self.tree, &self.root, path.clone(), lang, lines, bytes);
+        match outcome {
+            Some(UpsertOutcome::Inserted) => {
+                let s = self.stats.entry(lang).or_default();
+                s.files += 1;
+                s.lines += lines;
+                s.bytes += bytes;
+                self.total_files += 1;
+                self.total_lines += lines;
+                self.total_bytes += bytes;
+            }
+            Some(UpsertOutcome::Replaced {
+                prev_lang,
+                prev_lines,
+                prev_bytes,
+            }) => {
+                if let Some(s) = self.stats.get_mut(&prev_lang) {
+                    s.lines = s.lines.saturating_sub(prev_lines);
+                    s.bytes = s.bytes.saturating_sub(prev_bytes);
+                    if prev_lang != lang {
+                        s.files = s.files.saturating_sub(1);
+                    }
+                }
+                let s = self.stats.entry(lang).or_default();
+                s.lines += lines;
+                s.bytes += bytes;
+                if prev_lang != lang {
+                    s.files += 1;
+                }
+                self.total_lines = self.total_lines + lines - prev_lines;
+                self.total_bytes = self.total_bytes + bytes - prev_bytes;
+            }
+            None => return,
+        }
         self.last_path = Some(path.clone());
         self.stats_dirty = true;
         self.items_dirty = true;
-        if lines > 0 {
-            tree::insert(&mut self.tree, &self.root, path, lang, lines);
+        if pulse {
+            self.pulses.insert(path, Instant::now());
         }
+    }
+
+    /// Watch-driven delete. Subtracts the file's previous contribution
+    /// from rollups, prunes empty parent folders, and skips the pulse
+    /// (the tile is gone — there's nothing to flash).
+    pub fn watch_remove(&mut self, path: &Path) {
+        let Some(removed) = tree::remove(&mut self.tree, &self.root, path) else {
+            return;
+        };
+        if let Some(s) = self.stats.get_mut(&removed.lang) {
+            s.files = s.files.saturating_sub(1);
+            s.lines = s.lines.saturating_sub(removed.lines);
+            s.bytes = s.bytes.saturating_sub(removed.bytes);
+            if s.files == 0 && s.lines == 0 && s.bytes == 0 {
+                self.stats.remove(&removed.lang);
+            }
+        }
+        self.total_files = self.total_files.saturating_sub(1);
+        self.total_lines = self.total_lines.saturating_sub(removed.lines);
+        self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+        self.pulses.remove(path);
+        self.stats_dirty = true;
+        self.items_dirty = true;
+    }
+
+    /// Brightness boost in `0.0..=PULSE_PEAK` for `path`, computed with
+    /// an ease-out fade from start. `0.0` once the pulse has expired or
+    /// the path was never pulsed.
+    pub fn pulse_factor(&self, path: &Path) -> f32 {
+        let Some(start) = self.pulses.get(path) else {
+            return 0.0;
+        };
+        let elapsed = start.elapsed();
+        if elapsed >= PULSE_DURATION {
+            return 0.0;
+        }
+        let t = elapsed.as_secs_f32() / PULSE_DURATION.as_secs_f32();
+        // Ease-out: fast at the start, slow as it dies. Reads as a
+        // genuine flash rather than a slow lerp.
+        let eased = 1.0 - (1.0 - t).powi(2);
+        PULSE_PEAK * (1.0 - eased)
+    }
+
+    /// Whether any pulse is still animating. The render loop uses this
+    /// to keep redrawing during the fade-out window.
+    pub fn has_active_pulses(&self) -> bool {
+        let now = Instant::now();
+        self.pulses
+            .values()
+            .any(|t| now.duration_since(*t) < PULSE_DURATION)
+    }
+
+    /// Pulse factor for a tile. For a file tile it's the file's own
+    /// pulse; for a folder tile it's the strongest pulse of any
+    /// descendant — so a save deep inside a folder also lights up the
+    /// containing tile in the tree view, where the file itself isn't
+    /// visible.
+    pub fn tile_pulse(&self, target: &TileTarget) -> f32 {
+        if self.pulses.is_empty() {
+            return 0.0;
+        }
+        match target {
+            TileTarget::File(p) => self.pulse_factor(p),
+            TileTarget::Folder(segs) => {
+                let mut prefix = self.root.clone();
+                for s in segs {
+                    prefix.push(s);
+                }
+                let mut best = 0.0_f32;
+                for path in self.pulses.keys() {
+                    if path.starts_with(&prefix) {
+                        let f = self.pulse_factor(path);
+                        if f > best {
+                            best = f;
+                        }
+                    }
+                }
+                best
+            }
+        }
+    }
+
+    /// Drop expired pulse entries. Called once per frame so the map
+    /// can't grow unbounded under sustained file churn.
+    pub fn gc_pulses(&mut self) {
+        let now = Instant::now();
+        self.pulses
+            .retain(|_, t| now.duration_since(*t) < PULSE_DURATION);
     }
 
     pub fn current_folder(&self) -> &FolderNode {
