@@ -13,6 +13,8 @@ of code and colored by language. Inspired by
 ## Install
 
 ```bash
+cargo install --git https://github.com/leonardcser/tcloc
+# or from a local clone
 cargo install --path .
 ```
 
