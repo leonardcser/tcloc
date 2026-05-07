@@ -7,7 +7,7 @@
 //! mixing naturally with the tile colour.
 //!
 //! Coordinates are in sub-cells, matching the rest of the renderer.
-use ratatui::style::Color;
+use smelt_term::grid::Color;
 
 use font8x8::legacy::BASIC_LEGACY;
 

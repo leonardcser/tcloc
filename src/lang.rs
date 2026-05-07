@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use ratatui::style::Color;
+use smelt_term::grid::Color;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Lang(pub &'static str);
@@ -349,7 +349,7 @@ fn tables() -> &'static Tables {
         let mut color_by_lang = HashMap::new();
         for def in LANGS {
             let (r, g, b) = def.color;
-            color_by_lang.insert(def.name, Color::Rgb(r, g, b));
+            color_by_lang.insert(def.name, Color::Rgb { r, g, b });
             for ext in def.exts {
                 by_ext.insert(*ext, def);
             }
@@ -393,7 +393,11 @@ pub fn color(lang: Lang) -> Color {
         .color_by_lang
         .get(lang.0)
         .copied()
-        .unwrap_or(Color::Rgb(150, 150, 150))
+        .unwrap_or(Color::Rgb {
+            r: 150,
+            g: 150,
+            b: 150,
+        })
 }
 
 #[cfg(test)]
@@ -426,7 +430,7 @@ mod tests {
         let r = detect(Path::new("a.rs")).unwrap();
         // Just ensure it returns a defined RGB color.
         match color(r) {
-            Color::Rgb(_, _, _) => {}
+            Color::Rgb { .. } => {}
             _ => panic!("expected Rgb"),
         }
     }

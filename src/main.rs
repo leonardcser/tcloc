@@ -12,7 +12,7 @@ mod treemap;
 mod ui;
 mod watcher;
 
-use std::io::{self, BufWriter, Stdout};
+use std::io::{self, BufWriter, Stdout, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,9 +25,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use smelt_term::{Rect, Surface};
 
 use crate::alloc_track::CountingAllocator;
 use crate::app::{App, NavDir, TileTarget};
@@ -51,12 +49,6 @@ fn main() -> io::Result<()> {
     let (tx, rx) = mpsc::channel::<ScanEvent>();
     scanner::spawn(scan_cfg.clone(), tx);
 
-    // Watch channel + shared metadata cache. The watcher is spawned
-    // after the initial scan finishes (see `run`) so it doesn't race
-    // the walker on the same tree. The cache is filled here as scan
-    // events arrive, so by the time the watcher comes online it
-    // already knows every file's `(mtime, size)` and can short-circuit
-    // spurious events from the first keystroke.
     let (watch_tx, watch_rx) = mpsc::channel::<WatchEvent>();
     let meta_cache: MetaCache =
         std::sync::Arc::new(std::sync::Mutex::new(hashbrown::HashMap::new()));
@@ -67,8 +59,6 @@ fn main() -> io::Result<()> {
 
     let mut app = App::new(root);
     app.bench.enabled = bench_enabled;
-    // Mark watch mode at startup so the status badge skips the "DONE"
-    // intermediate state and goes straight from SCANNING to WATCHING.
     app.watching = watch_enabled;
 
     let scan_started = Instant::now();
@@ -77,16 +67,18 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    // Wrap stdout in a BufWriter so crossterm's many small per-cell writes
+    // Wrap stdout in a BufWriter so smelt-ui's many small per-cell writes
     // are coalesced into one syscall per frame instead of one per cell.
     // 256 KiB is enough to hold a full 240×60-cell diff worth of escape
-    // sequences without ever flushing mid-frame; ratatui calls flush()
-    // exactly once at the end of `terminal.draw`.
-    let buffered = io::BufWriter::with_capacity(256 * 1024, stdout);
-    let mut terminal = Terminal::new(CrosstermBackend::new(buffered))?;
+    // sequences without flushing mid-frame; smelt-ui's flush path drops
+    // back to the underlying writer once per frame.
+    let mut writer = io::BufWriter::with_capacity(256 * 1024, stdout);
+    let (term_w, term_h) = crossterm::terminal::size()?;
+    let mut ui = Surface::new(term_w, term_h);
 
     let res = run(
-        &mut terminal,
+        &mut ui,
+        &mut writer,
         app,
         rx,
         watch_rx,
@@ -98,12 +90,10 @@ fn main() -> io::Result<()> {
     );
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+    execute!(writer, DisableMouseCapture, LeaveAlternateScreen)?;
+    // Show the cursor again after leaving the alt screen.
+    execute!(writer, crossterm::cursor::Show)?;
+    writer.flush()?;
 
     let final_app = res?;
     if bench_enabled {
@@ -122,7 +112,8 @@ fn main() -> io::Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+    ui: &mut Surface,
+    writer: &mut BufWriter<Stdout>,
     mut app: App,
     rx: mpsc::Receiver<ScanEvent>,
     watch_rx: mpsc::Receiver<WatchEvent>,
@@ -136,24 +127,16 @@ fn run(
     let drain_budget = Duration::from_millis(8);
     let mut frame_interval = base_interval;
     let mut last_draw = Instant::now() - frame_interval;
-    // Distinguish input-driven redraws (preempt the cadence for snappy
-    // feedback) from scan-driven redraws (respect frame_interval so a
-    // huge terminal isn't pinned at 100% emitting escape sequences).
     let mut input_dirty = true;
     let mut scan_dirty = false;
     let mut done_at: Option<Instant> = None;
     let mut pending_input_at: Option<Instant> = None;
-    // Live debouncer handle. Held for the program lifetime — dropping
-    // it stops the watcher. `None` until the initial scan finishes.
     let mut _watcher_handle: Option<
         notify_debouncer_full::Debouncer<
             notify::RecommendedWatcher,
             notify_debouncer_full::RecommendedCache,
         >,
     > = None;
-    // Distinct from `_watcher_handle.is_none()`: we tried once and
-    // gave up. Without this we'd retry on every subsequent drain that
-    // returns true, spamming logs and CPU.
     let mut watcher_tried = false;
 
     loop {
@@ -165,11 +148,6 @@ fn run(
 
         if drain_events(&rx, &mut app, &meta_cache, &mut done_at, drain_budget) {
             scan_dirty = true;
-            // Bring the watcher online the first time we see a Done,
-            // but only when --watch is set. The cache is already
-            // populated with every file's (mtime, size), so editor
-            // saves on day-old files don't trigger redundant
-            // re-counts.
             if watch_enabled && app.done && !watcher_tried {
                 watcher_tried = true;
                 _watcher_handle = watcher::spawn(
@@ -177,9 +155,6 @@ fn run(
                     watch_tx.clone(),
                     std::sync::Arc::clone(&meta_cache),
                 );
-                // If the watcher fails to spawn (e.g. inotify limits on
-                // Linux), drop the WATCHING badge back to DONE so the
-                // user isn't lied to about live updates being on.
                 if _watcher_handle.is_none() {
                     app.watching = false;
                 }
@@ -188,9 +163,6 @@ fn run(
         if drain_watch_events(&watch_rx, &mut app, &meta_cache) {
             scan_dirty = true;
         }
-        // While any pulse is mid-fade, keep redrawing on the cadence so
-        // the animation actually animates. `gc_pulses` keeps the map
-        // bounded under sustained file churn.
         if app.has_active_pulses() {
             scan_dirty = true;
         }
@@ -198,9 +170,7 @@ fn run(
         let interval_elapsed = last_draw.elapsed() >= frame_interval;
         if input_dirty || (scan_dirty && interval_elapsed) {
             let t0 = Instant::now();
-            draw_frame(terminal, &mut app, pending_input_at.take())?;
-            // Adaptive cadence: never schedule the next frame closer than
-            // ~1.2× the last frame's wall time (capped at 200ms).
+            draw_frame(ui, writer, &mut app, pending_input_at.take())?;
             let adaptive = t0
                 .elapsed()
                 .saturating_mul(6)
@@ -218,7 +188,7 @@ fn run(
             .max(Duration::from_millis(1));
         if event::poll(poll_for)? {
             let received_at = Instant::now();
-            match handle_event(event::read()?, &mut app) {
+            match handle_event(event::read()?, ui, &mut app) {
                 EventOutcome::Quit => return Ok(app),
                 EventOutcome::Redraw => {
                     input_dirty = true;
@@ -227,7 +197,7 @@ fn run(
                     }
                 }
                 EventOutcome::OpenEditor(path) => {
-                    open_in_editor(terminal, &path)?;
+                    open_in_editor(ui, writer, &path)?;
                     input_dirty = true;
                 }
                 EventOutcome::Ignored => {}
@@ -240,7 +210,8 @@ fn run(
 /// alternate screen + raw mode so the app can keep running. The editor
 /// inherits stdio so it works for full-screen editors like vim/nvim.
 fn open_in_editor(
-    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+    ui: &mut Surface,
+    writer: &mut BufWriter<Stdout>,
     path: &std::path::Path,
 ) -> io::Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
@@ -251,11 +222,8 @@ fn open_in_editor(
     let extra: Vec<&str> = parts.collect();
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    execute!(writer, DisableMouseCapture, LeaveAlternateScreen)?;
+    writer.flush()?;
 
     let _ = std::process::Command::new(cmd)
         .args(&extra)
@@ -263,17 +231,14 @@ fn open_in_editor(
         .status();
 
     enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
-    terminal.clear()?;
+    execute!(writer, EnterAlternateScreen, EnableMouseCapture)?;
+    // Force the next frame to repaint everything — the editor wiped the
+    // alt screen, so smelt-ui's diff-against-previous would no-op the
+    // unchanged cells and leave a blank screen behind.
+    ui.force_redraw();
     Ok(())
 }
 
-/// Pull scan events out of the channel until empty or budget exhausted.
-/// Returns true if any state-changing event was received (caller redraws).
 fn drain_events(
     rx: &mpsc::Receiver<ScanEvent>,
     app: &mut App,
@@ -318,9 +283,6 @@ fn drain_events(
     }
 }
 
-/// Drain whatever the watcher has produced. Each batch ends with a
-/// `BatchDone` marker so the caller can collapse "20 files just got
-/// touched by a save" into a single redraw without flashing.
 fn drain_watch_events(rx: &mpsc::Receiver<WatchEvent>, app: &mut App, meta: &MetaCache) -> bool {
     let mut changed = false;
     loop {
@@ -346,8 +308,6 @@ fn drain_watch_events(rx: &mpsc::Receiver<WatchEvent>, app: &mut App, meta: &Met
                 changed = true;
             }
             Ok(WatchEvent::BatchDone) => {
-                // Sentinel only: lets us bound the loop per batch
-                // rather than starving input handling on huge bursts.
                 return changed;
             }
             Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -358,7 +318,8 @@ fn drain_watch_events(rx: &mpsc::Receiver<WatchEvent>, app: &mut App, meta: &Met
 }
 
 fn draw_frame(
-    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+    ui: &mut Surface,
+    writer: &mut BufWriter<Stdout>,
     app: &mut App,
     input_at: Option<Instant>,
 ) -> io::Result<()> {
@@ -369,7 +330,7 @@ fn draw_frame(
         None
     };
     let _g = perf::begin("loop.terminal_draw");
-    terminal.draw(|f| ui::render(f, app))?;
+    crate::ui::render(ui, app, writer)?;
     drop(_g);
     let frame_d = frame_t0.elapsed();
     if let Some(pre) = alloc_pre {
@@ -396,11 +357,12 @@ enum EventOutcome {
     OpenEditor(std::path::PathBuf),
 }
 
-fn handle_event(ev: Event, app: &mut App) -> EventOutcome {
+fn handle_event(ev: Event, ui: &mut Surface, app: &mut App) -> EventOutcome {
     match ev {
         Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(key, app),
         Event::Mouse(me) => handle_mouse(me, app),
-        Event::Resize(_, _) => {
+        Event::Resize(w, h) => {
+            ui.set_terminal_size(w, h);
             // Tile rects are sized in cells, so a resize invalidates the
             // cached layout. Items themselves don't change.
             app.last_tiles.clear();
@@ -470,5 +432,5 @@ fn handle_mouse(me: event::MouseEvent, app: &mut App) -> EventOutcome {
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
-    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    r.contains(y, x)
 }

@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/term"]
+
 [package]
 name = "tcloc"
 version = "0.1.0"
@@ -13,4 +16,4 @@ memchr = "2.8.0"
 memmap2 = "0.9.10"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
-ratatui = "0.30.0"
+smelt_term = { package = "smelt-term", path = "crates/term" }

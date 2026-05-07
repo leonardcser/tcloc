@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ratatui::layout::Rect;
+use smelt_term::Rect;
 
 use crate::lang::Lang;
 use crate::tree::{self, FolderNode, Node, UpsertOutcome};
@@ -418,8 +418,8 @@ impl App {
         // inside it both start where the current tile ends), the larger
         // tile wins via the area tiebreaker, so the user lands on the
         // outer container rather than its interior.
-        let cur_x0 = current_rect.x as i32;
-        let cur_y0 = current_rect.y as i32;
+        let cur_x0 = current_rect.left as i32;
+        let cur_y0 = current_rect.top as i32;
         let cur_x1 = cur_x0 + current_rect.width as i32;
         let cur_y1 = cur_y0 + current_rect.height as i32;
 
@@ -429,8 +429,8 @@ impl App {
             if *target == selected_target {
                 continue;
             }
-            let x0 = rect.x as i32;
-            let y0 = rect.y as i32;
+            let x0 = rect.left as i32;
+            let y0 = rect.top as i32;
             let x1 = x0 + rect.width as i32;
             let y1 = y0 + rect.height as i32;
 
@@ -525,7 +525,7 @@ impl App {
 
     pub fn hit(&self, x: u16, y: u16) -> Option<&TileTarget> {
         for (rect, target) in self.last_tiles.iter().rev() {
-            if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            if rect.contains(y, x) {
                 return Some(target);
             }
         }

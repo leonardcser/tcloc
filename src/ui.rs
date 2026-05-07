@@ -1,11 +1,11 @@
 use std::cell::RefCell;
+use std::io::Write;
 
-use ratatui::Frame;
-use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use smelt_term::grid::{Color, GridSlice, Style};
+use smelt_term::{
+    Border, Constraint, LayoutTree, Line, PaintId, Rect, Span, Surface,
+};
+use smelt_term::layout::BorderStyle;
 
 use crate::app::{App, TileTarget, View};
 use crate::bitmap_font;
@@ -14,12 +14,17 @@ use crate::lang;
 use crate::tree::{FolderNode, Node};
 use crate::treemap::{self, Item};
 
+// Paint-leaf identifiers shared between the layout tree builder and
+// the dispatch closure handed to `Surface::render`.
+const PAINT_HEADER: PaintId = PaintId(1);
+const PAINT_TREEMAP: PaintId = PaintId(2);
+const PAINT_LEGEND: PaintId = PaintId(3);
+const PAINT_FOOTER: PaintId = PaintId(4);
+const PAINT_BENCH: PaintId = PaintId(5);
+
 const GAP_SUBCELLS: u16 = 1;
 const MIN_TILE_SUBCELLS: u16 = 3;
 const MAX_LAYOUT_PASSES: u32 = 16;
-// Terminal-size gate: bitmap labels are only enabled when the render area
-// is at least this big. Below the threshold every tile uses plain ASCII —
-// keeps tiny terminals readable and skips the per-frame bitmap loop.
 const BITMAP_MIN_TERMINAL_W: u16 = 120;
 const BITMAP_MIN_TERMINAL_H: u16 = 36;
 
@@ -27,10 +32,6 @@ fn bitmap_enabled(area: Rect) -> bool {
     area.width >= BITMAP_MIN_TERMINAL_W && area.height >= BITMAP_MIN_TERMINAL_H
 }
 
-/// Compose the tile background colour from selection + pulse. Selected
-/// tiles get a flat brightness boost; pulses fade from `PULSE_PEAK` to
-/// 0 over `PULSE_DURATION` (handled by `App::tile_pulse`). Both are
-/// stacked, with `brighten` clamping the combined amount.
 fn tile_color(base: Color, selected: bool, pulse: f32) -> Color {
     let mut c = base;
     if selected {
@@ -42,24 +43,14 @@ fn tile_color(base: Color, selected: bool, pulse: f32) -> Color {
     c
 }
 
-// Per-scale minimum render-area size in cells. The largest scale whose
-// minimum the area meets gets used. Indexed by `scale - 1`. Bumping an
-// entry up means that scale only triggers on bigger terminals.
 const SCALE_MIN_AREA_CELLS: [(u16, u16); bitmap_font::MAX_SCALE as usize] = [
-    // (min_width, min_height) per scale
-    (80, 24),  // scale 1 — kicks in once bitmaps are enabled at all
-    (220, 64), // scale 2 — wants a roomy terminal before doubling up
-    (260, 76), // scale 3 — only on near-fullscreen 4K-ish terminals
+    (80, 24),
+    (220, 64),
+    (260, 76),
 ];
-// Above scale 1, a label may not exceed this fraction of its tile on
-// either axis. Stops short names like `src/` from ballooning to fill
-// huge tiles. At scale 1 the rule is just "physical fit with a 1-cell
-// breathing pad" so the smallest size always lights up if it fits at all.
 const LABEL_MAX_TILE_FRAC_NUM: u16 = 3;
-const LABEL_MAX_TILE_FRAC_DEN: u16 = 5; // 60 %
+const LABEL_MAX_TILE_FRAC_DEN: u16 = 5;
 
-/// Per-frame upper bound on the bitmap scale, derived from the render
-/// area. Returns `0` when even scale 1's minimum isn't met.
 fn max_label_scale(area: Rect) -> u16 {
     (1..=bitmap_font::MAX_SCALE)
         .rev()
@@ -70,13 +61,8 @@ fn max_label_scale(area: Rect) -> u16 {
         .unwrap_or(0)
 }
 
-// Sub-rows of pad inside the folder label band, above and below the glyph.
 const NESTED_BAND_PAD_SUBROWS: u16 = 1;
 
-/// Largest scale in `1..=max_scale` whose label fits the tile, or `None`
-/// if nothing does. At scale 1 the rule is just physical fit with a
-/// 1-cell breathing pad; above scale 1 the label additionally has to
-/// stay inside `LABEL_MAX_TILE_FRAC_NUM/DEN` of the tile.
 fn pick_label_scale(name: &str, tile_w: u16, tile_h: u16, max_scale: u16) -> Option<u16> {
     if name.is_empty() || !name.is_ascii() || max_scale == 0 {
         return None;
@@ -109,26 +95,17 @@ thread_local! {
     static SCALED_PAINTED_BUF: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
 }
 
-// Sub-cell padding the parent folder reserves around its squarified children.
-// The folder colour shows through as a thin border, signalling containment.
 const NESTED_INNER_PAD: u16 = 1;
 
 struct NestedNode {
-    rect: Rect, // sub-cell, post-gap shrink
+    rect: Rect,
     color: Color,
     target: TileTarget,
     name: String,
     subtitle1: String,
     subtitle2: String,
     is_folder: bool,
-    // Plain-text fallback character rows when no bitmap label fits. For
-    // files this caps how many subtitle lines we'll write.
     label_rows: u16,
-    // Bitmap scale chosen for this node's label. `None` means "no
-    // bitmap; fall back to plain text overlay if `label_rows > 0`". For
-    // files we pick this dynamically each frame inside `render_nested`;
-    // for folders it's set during `build_nested_at` because the band
-    // reservation affects how children are laid out.
     bitmap_scale: Option<u16>,
 }
 
@@ -142,45 +119,73 @@ struct TileItem {
     target: TileTarget,
 }
 
-// ── top-level layout ────────────────────────────────────────────────────────
+// ── top-level layout / dispatch ─────────────────────────────────────────────
 
-pub fn render(f: &mut Frame, app: &mut App) {
+pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::Result<()> {
     let _g = crate::perf::begin("ui.render");
-    // Drop expired pulses up front: keeps the per-tile lookup small
-    // and avoids paying for stale animation state for the rest of
-    // the session.
     app.gc_pulses();
-    let area = f.area();
-    let mut constraints = vec![Constraint::Length(2), Constraint::Min(0)];
+
+    // Build the splits layout for this frame. Header (2 = 1 content +
+    // 1 border) → body (fill) → optional bench HUD (1) → footer (1).
+    // Body horizontally splits into treemap (fill) | legend (34).
+    // Chrome (border + title) attaches to leaves directly via
+    // `with_border` / `with_title`; the renderer auto-wraps the leaf
+    // and feeds each render callback the inset slice — no manual
+    // border drawing or rect math on the consumer side.
+    let view_label = match app.view {
+        View::Tree => " tree ",
+        View::Files => " files ",
+        View::Nested => " nested ",
+    };
+    let treemap_title = Line::new()
+        .push(Span::styled(view_label, Style::new().fg(Color::White)))
+        .push(Span::styled(
+            "(area = lines, color = language)",
+            Style::new().fg(Color::DarkGrey),
+        ));
+    let mut items = vec![
+        (
+            Constraint::Length(2),
+            LayoutTree::leaf(PAINT_HEADER)
+                .with_border(Border::bottom(BorderStyle::Single)),
+        ),
+        (
+            Constraint::Fill,
+            LayoutTree::hbox(vec![
+                (
+                    Constraint::Fill,
+                    LayoutTree::leaf(PAINT_TREEMAP)
+                        .with_border(Border::SINGLE)
+                        .with_title(treemap_title),
+                ),
+                (
+                    Constraint::Length(34),
+                    LayoutTree::leaf(PAINT_LEGEND)
+                        .with_border(Border::SINGLE)
+                        .with_title(" languages "),
+                ),
+            ]),
+        ),
+    ];
     if app.bench.enabled {
-        constraints.push(Constraint::Length(1));
+        items.push((Constraint::Length(1), LayoutTree::leaf(PAINT_BENCH)));
     }
-    constraints.push(Constraint::Length(1));
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
+    items.push((Constraint::Length(1), LayoutTree::leaf(PAINT_FOOTER)));
+    ui.set_layout(LayoutTree::vbox(items));
 
-    render_header(f, chunks[0], app);
-
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(34)])
-        .split(chunks[1]);
-
-    render_treemap(f, body[0], app);
-    render_legend(f, body[1], app);
-    if app.bench.enabled {
-        render_bench_hud(f, chunks[2], app);
-        render_footer(f, chunks[3], app);
-    } else {
-        render_footer(f, chunks[2], app);
-    }
+    ui.render(w, |id, slice, _ctx| match id {
+        PAINT_HEADER => render_header(slice, app),
+        PAINT_TREEMAP => render_treemap(slice, app),
+        PAINT_LEGEND => render_legend(slice, app),
+        PAINT_FOOTER => render_footer(slice, app),
+        PAINT_BENCH => render_bench_hud(slice, app),
+        _ => {}
+    })
 }
 
 // ── chrome (header / footer / bench HUD) ────────────────────────────────────
 
-fn render_header(f: &mut Frame, area: Rect, app: &App) {
+fn render_header(slice: &mut GridSlice<'_>, app: &App) {
     let _g = crate::perf::begin("ui.header");
     let (status_text, status_bg) = if !app.done {
         (" SCANNING ", Color::Yellow)
@@ -195,76 +200,60 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         fmt_bytes_short(app.total_bytes),
         format!("{:.1}s", app.elapsed_secs()),
     ];
-    // Width includes ` · ` (3 cells) between every adjacent pair so the
-    // right-chunk reservation is exact.
-    let stats_width = stat_items.iter().map(|s| s.chars().count()).sum::<usize>()
-        + 3 * stat_items.len().saturating_sub(1);
+
+    let w = slice.width();
+
+    // Left: status badge + breadcrumb on row 0.
+    let badge_style = Style::new().fg(Color::Black).bg(status_bg).bold();
+    let mut col: u16 = 0;
+    col = put_str_clip(slice, col, 0, status_text, badge_style);
+    col = put_str_clip(slice, col, 0, " ", Style::default());
     let (root, zoom) = app.breadcrumb_parts();
-    let block = Block::default().borders(Borders::BOTTOM);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    col = put_str_clip(slice, col, 0, &root, Style::new().fg(Color::White));
+    let _ = put_str_clip(slice, col, 0, &zoom, Style::new().fg(Color::DarkGrey));
 
-    // Reserve exactly the width the stats need on the right; the left
-    // half flexes for the breadcrumb (which gets truncated by ratatui if
-    // the terminal is too narrow).
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(stats_width as u16)])
-        .split(inner);
-
-    let left = Line::from(vec![
-        Span::styled(
-            status_text,
-            Style::default()
-                .bg(status_bg)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(root, Style::default().fg(Color::White)),
-        Span::styled(zoom, Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(left), chunks[0]);
-
-    let mut stats_spans: Vec<Span> = Vec::with_capacity(stat_items.len() * 2);
+    // Right: stats, dot-separated, right-aligned. Compute width first so
+    // we can pin it to the trailing edge.
+    let stats_width: usize = stat_items.iter().map(|s| s.chars().count()).sum::<usize>()
+        + 3 * stat_items.len().saturating_sub(1);
+    if stats_width as u16 > w {
+        return;
+    }
+    let mut col = w - stats_width as u16;
     for (i, item) in stat_items.iter().enumerate() {
         if i > 0 {
-            stats_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            col = put_str_clip(slice, col, 0, " · ", Style::new().fg(Color::DarkGrey));
         }
-        stats_spans.push(Span::styled(item.clone(), Style::default().fg(Color::Gray)));
+        col = put_str_clip(slice, col, 0, item, Style::new().fg(Color::Grey));
     }
-    f.render_widget(
-        Paragraph::new(Line::from(stats_spans)).alignment(Alignment::Right),
-        chunks[1],
-    );
 }
 
-fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+fn render_footer(slice: &mut GridSlice<'_>, app: &App) {
     let path = app
         .last_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let path = truncate_left(&path, area.width.saturating_sub(2) as usize);
-    let line = Line::from(vec![
-        Span::styled("hjkl/↑↓←→", Style::default().fg(Color::Yellow)),
-        Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("⏎", Style::default().fg(Color::Yellow)),
-        Span::styled(" zoom  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("esc", Style::default().fg(Color::Yellow)),
-        Span::styled(" up  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("tab", Style::default().fg(Color::Yellow)),
-        Span::styled(" view  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("o", Style::default().fg(Color::Yellow)),
-        Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(path, Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    let path = truncate_left(&path, slice.width().saturating_sub(2) as usize);
+    let key = Style::new().fg(Color::Yellow);
+    let dim = Style::new().fg(Color::DarkGrey);
+    let mut col = 0u16;
+    col = put_str_clip(slice, col, 0, "hjkl/↑↓←→", key);
+    col = put_str_clip(slice, col, 0, " select  ", dim);
+    col = put_str_clip(slice, col, 0, "⏎", key);
+    col = put_str_clip(slice, col, 0, " zoom  ", dim);
+    col = put_str_clip(slice, col, 0, "esc", key);
+    col = put_str_clip(slice, col, 0, " up  ", dim);
+    col = put_str_clip(slice, col, 0, "tab", key);
+    col = put_str_clip(slice, col, 0, " view  ", dim);
+    col = put_str_clip(slice, col, 0, "o", key);
+    col = put_str_clip(slice, col, 0, " open  ", dim);
+    col = put_str_clip(slice, col, 0, "q", key);
+    col = put_str_clip(slice, col, 0, " quit  ", dim);
+    let _ = put_str_clip(slice, col, 0, &path, dim);
 }
 
-fn render_bench_hud(f: &mut Frame, area: Rect, app: &App) {
+fn render_bench_hud(slice: &mut GridSlice<'_>, app: &App) {
     let elapsed = app.elapsed_secs().max(0.001);
     let files_per_s = app.total_files as f64 / elapsed;
     let lines_per_s = app.total_lines as f64 / elapsed;
@@ -287,102 +276,105 @@ fn render_bench_hud(f: &mut Frame, area: Rect, app: &App) {
         .last_input_latency
         .map(|d| d.as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
-    let line = Line::from(vec![
-        Span::styled(
-            "BENCH ",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+    let mut col = 0u16;
+    col = put_str_clip(
+        slice,
+        col,
+        0,
+        "BENCH ",
+        Style::new().fg(Color::Magenta).bold(),
+    );
+    col = put_str_clip(
+        slice,
+        col,
+        0,
+        &format!(
+            "frame {:.2}ms (p95 {:.2}ms, {:.0} fps)  ",
+            frame_avg.as_secs_f64() * 1000.0,
+            frame_p95.as_secs_f64() * 1000.0,
+            fps,
         ),
-        Span::styled(
-            format!(
-                "frame {:.2}ms (p95 {:.2}ms, {:.0} fps)  ",
-                frame_avg.as_secs_f64() * 1000.0,
-                frame_p95.as_secs_f64() * 1000.0,
-                fps,
-            ),
-            Style::default().fg(Color::White),
+        Style::new().fg(Color::White),
+    );
+    col = put_str_clip(
+        slice,
+        col,
+        0,
+        &format!("input→draw {input_lat_ms:.2}ms  "),
+        Style::new().fg(Color::White),
+    );
+    col = put_str_clip(
+        slice,
+        col,
+        0,
+        &format!(
+            "layout {:.2}ms iters {} drawn {}  ",
+            app.bench.last_treemap_layout.as_secs_f64() * 1000.0,
+            app.bench.last_treemap_iters,
+            app.bench.last_tiles_drawn,
         ),
-        Span::styled(
-            format!("input→draw {input_lat_ms:.2}ms  "),
-            Style::default().fg(Color::White),
+        Style::new().fg(Color::Cyan),
+    );
+    col = put_str_clip(
+        slice,
+        col,
+        0,
+        &format!(
+            "hb {:.2}ms tx {:.2}ms  ",
+            app.bench.last_halfblock.as_secs_f64() * 1000.0,
+            app.bench.last_text_overlay.as_secs_f64() * 1000.0,
         ),
-        Span::styled(
-            format!(
-                "layout {:.2}ms iters {} drawn {}  ",
-                app.bench.last_treemap_layout.as_secs_f64() * 1000.0,
-                app.bench.last_treemap_iters,
-                app.bench.last_tiles_drawn,
-            ),
-            Style::default().fg(Color::Cyan),
+        Style::new().fg(Color::Cyan),
+    );
+    col = put_str_clip(
+        slice,
+        col,
+        0,
+        &format!(
+            "scan {:.0} f/s {:.1} M ln/s {:.1} MB/s  per-file {:.0}µs  ",
+            files_per_s,
+            lines_per_s / 1e6,
+            mb_per_s,
+            avg_count as f64 / 1000.0,
         ),
-        Span::styled(
-            format!(
-                "hb {:.2}ms tx {:.2}ms  ",
-                app.bench.last_halfblock.as_secs_f64() * 1000.0,
-                app.bench.last_text_overlay.as_secs_f64() * 1000.0,
-            ),
-            Style::default().fg(Color::Cyan),
+        Style::new().fg(Color::Yellow),
+    );
+    let _ = put_str_clip(
+        slice,
+        col,
+        0,
+        &format!(
+            "alloc {}/{}",
+            app.bench.last_frame_allocs,
+            fmt_bytes_short(app.bench.last_frame_alloc_bytes),
         ),
-        Span::styled(
-            format!(
-                "scan {:.0} f/s {:.1} M ln/s {:.1} MB/s  per-file {:.0}µs  ",
-                files_per_s,
-                lines_per_s / 1e6,
-                mb_per_s,
-                avg_count as f64 / 1000.0,
-            ),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::styled(
-            format!(
-                "alloc {}/{}",
-                app.bench.last_frame_allocs,
-                fmt_bytes_short(app.bench.last_frame_alloc_bytes),
-            ),
-            Style::default().fg(Color::Green),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+        Style::new().fg(Color::Green),
+    );
 }
 
 // ── treemap ─────────────────────────────────────────────────────────────────
 
-fn render_treemap(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_treemap(slice: &mut GridSlice<'_>, app: &mut App) {
     let _g = crate::perf::begin("ui.treemap");
-    let title = match app.view {
-        View::Tree => " tree ",
-        View::Files => " files ",
-        View::Nested => " nested ",
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::styled(title, Style::default().fg(Color::White)),
-            Span::styled(
-                "(area = lines, color = language)",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    f.render_widget(Clear, inner);
     app.last_tiles.clear();
 
-    if inner.width == 0 || inner.height == 0 {
+    if slice.width() == 0 || slice.height() == 0 {
         return;
     }
+    let inner = slice.screen_rect();
 
     if matches!(app.view, View::Nested) {
-        render_nested(f, inner, app);
+        render_nested(slice, inner, app);
     } else {
-        render_flat(f, inner, app);
+        render_flat(slice, inner, app);
     }
 }
 
 /// Flat treemap path used by the Tree and Files views: every tile is a
-/// sibling competing for the same rect.
-fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
+/// sibling competing for the same rect. `inner` is in absolute screen
+/// coordinates; we use `slice.cell_mut` with slice-local coords for
+/// the half-block fill.
+fn render_flat(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
     ITEMS_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         if app.items_dirty {
@@ -394,15 +386,11 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
             return;
         }
 
-        // 1. Layout fractional rectangles in sub-cell space, dropping items
-        //    that would round below MIN_TILE_SUBCELLS in either dim.
         let tiles = layout_tiles(&buf, inner, app);
         if tiles.is_empty() {
             return;
         }
 
-        // 2. Rasterize into a sub-cell colour grid (gap reserved on
-        //    right + bottom of each tile).
         let cols = inner.width as usize;
         let sub_rows = (inner.height as usize) * 2;
         GRID_BUF.with(|g| {
@@ -419,12 +407,6 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
                     scaled_painted.clear();
                     scaled_painted.resize(visible.len(), false);
 
-                    // 3a. Paint scaled bitmap labels into the grid before
-                    //     compositing. Glyph "on" pixels overwrite tile
-                    //     sub-cells with the readable foreground; the half-
-                    //     block emitter below renders them as text.
-                    //     Skipped wholesale on small terminals via
-                    //     `bitmap_enabled(inner)`.
                     let _g = crate::perf::begin("ui.bitmap_labels");
                     if bitmap_enabled(inner) {
                         let max_scale = max_label_scale(inner);
@@ -441,8 +423,9 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
                             let fg = readable_fg(bg);
                             let label_w = bitmap_font::label_width(&item.name, scale);
                             let label_h = bitmap_font::label_height(scale);
-                            let x0 = r.x as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
-                            let y0 = r.y as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32;
+                            let x0 =
+                                r.left as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
+                            let y0 = r.top as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32;
                             bitmap_font::paint(
                                 &mut grid, cols, sub_rows, x0, y0, &item.name, fg, scale,
                             );
@@ -451,38 +434,23 @@ fn render_flat(f: &mut Frame, inner: Rect, app: &mut App) {
                     }
                     drop(_g);
 
-                    // 3b. Emit the half-block characters for the colour grid.
-                    composite_halfblocks(f.buffer_mut(), inner, &grid, cols);
-
-                    // 4. Overlay text labels on tiles that didn't get a
-                    //    bitmap label and still fit a character row.
-                    overlay_labels(f.buffer_mut(), inner, &visible, &buf, app, &scaled_painted);
+                    composite_halfblocks(slice, inner, &grid, cols);
+                    overlay_labels(slice, inner, &visible, &buf, app, &scaled_painted);
                 });
             });
         });
 
-        // 5. Save click targets keyed off the layout (not visible) rect so
-        //    the gap area still lands on the nearest tile.
         record_hit_regions(&tiles, &buf, inner, &mut app.last_tiles);
     });
 }
 
-/// Nested treemap: every folder is a container box, its files and
-/// subfolders are squarified inside it (recursively, no depth limit).
-/// Parents paint first so children overlay on top, and hit regions are
-/// recorded in the same order so deepest-tile wins on click.
-fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
+fn render_nested(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
     if app.current_folder().total_files == 0 {
         return;
     }
     let cols = inner.width as usize;
     let sub_rows = (inner.height as usize) * 2;
-    let root_rect = Rect {
-        x: 0,
-        y: 0,
-        width: inner.width,
-        height: sub_rows as u16,
-    };
+    let root_rect = Rect::new(0, 0, inner.width, sub_rows as u16);
 
     let bitmap_on = bitmap_enabled(inner);
     NESTED_BUF.with(|n| {
@@ -506,9 +474,6 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
         }
         record_layout_bench(app, layout_t0.elapsed(), 1, 0, nodes.len() as u32);
 
-        // Tracks which nodes got a scaled bitmap label so the plain-text
-        // overlay loop knows to skip them. Reused across frames to avoid
-        // a per-frame allocation when the tree is large.
         SCALED_PAINTED_BUF.with(|sp| {
             let mut scaled_painted = sp.borrow_mut();
             scaled_painted.clear();
@@ -523,28 +488,15 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
                     let pulse = app.tile_pulse(&node.target);
                     let color = tile_color(node.color, selected, pulse);
                     let r = node.rect;
-                    let sx_end = (r.x + r.width).min(cols as u16);
-                    let sy_end = (r.y + r.height).min(sub_rows as u16);
-                    for sy in r.y..sy_end {
+                    let sx_end = (r.left + r.width).min(cols as u16);
+                    let sy_end = (r.top + r.height).min(sub_rows as u16);
+                    for sy in r.top..sy_end {
                         let row_base = sy as usize * cols;
-                        for sx in r.x..sx_end {
+                        for sx in r.left..sx_end {
                             grid[row_base + sx as usize] = Some(color);
                         }
                     }
                 }
-                // Scaled bitmap labels: paint glyph pixels into the same grid
-                // before compositing. The half-block emitter below renders them
-                // as text on top of the tile colour.
-                //
-                // - Files: pick the largest scale that fits the file's interior
-                //   dynamically; centre the glyph block.
-                // - Folders: use the scale chosen at build time, paint into the
-                //   reserved band at the top of the folder rect. Children's
-                //   rects start below the band so they don't disturb the
-                //   glyph pixels.
-                //
-                // The whole loop is skipped on small terminals via the
-                // `bitmap_on` gate computed once per frame.
                 if bitmap_on {
                     let max_scale = max_label_scale(inner);
                     for (i, node) in nodes.iter().enumerate() {
@@ -553,13 +505,9 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
                         let pulse = app.tile_pulse(&node.target);
                         let bg = tile_color(node.color, selected, pulse);
                         let fg = readable_fg(bg);
-                        // Folders: use the scale chosen at build time, paint into
-                        //   the reserved band at the top of the rect.
-                        // Files: pick the largest fitting scale per frame and
-                        //   centre the glyph block.
                         let (scale, y0) = if node.is_folder {
                             let Some(s) = node.bitmap_scale else { continue };
-                            (s, r.y as i32 + NESTED_BAND_PAD_SUBROWS as i32)
+                            (s, r.top as i32 + NESTED_BAND_PAD_SUBROWS as i32)
                         } else {
                             let Some(s) =
                                 pick_label_scale(&node.name, r.width, r.height, max_scale)
@@ -569,22 +517,20 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
                             let label_h = bitmap_font::label_height(s);
                             (
                                 s,
-                                r.y as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32,
+                                r.top as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32,
                             )
                         };
                         let label_w = bitmap_font::label_width(&node.name, scale);
-                        let x0 = r.x as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
+                        let x0 = r.left as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
                         bitmap_font::paint(
                             &mut grid, cols, sub_rows, x0, y0, &node.name, fg, scale,
                         );
                         scaled_painted[i] = true;
                     }
                 }
-                composite_halfblocks(f.buffer_mut(), inner, &grid, cols);
+                composite_halfblocks(slice, inner, &grid, cols);
             });
 
-            // Labels: skip when there isn't a full character row inside the tile.
-            let buf = f.buffer_mut();
             for (i, node) in nodes.iter().enumerate() {
                 if scaled_painted[i] {
                     continue;
@@ -593,22 +539,18 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
                     continue;
                 }
                 let r = node.rect;
-                let y_start = (r.y as i32 + 1) / 2;
-                let y_end = (r.y as i32 + r.height as i32) / 2;
+                let y_start = (r.top as i32 + 1) / 2;
+                let y_end = (r.top as i32 + r.height as i32) / 2;
                 if y_end <= y_start {
                     continue;
                 }
-                let abs_x = inner.x as i32 + r.x as i32;
-                let abs_y = inner.y as i32 + y_start;
+                let abs_x = inner.left as i32 + r.left as i32;
+                let abs_y = inner.top as i32 + y_start;
                 let abs_w = r.width as i32;
                 let abs_h = y_end - y_start;
                 if abs_w < 3 || abs_h < 1 {
                     continue;
                 }
-                // For folders, label_rows is the cap that matches the reserved
-                // band; for files, label_rows is just the maximum we'd ever
-                // write. Both clamp to the actual character rows inside the
-                // tile (`abs_h`) so we never overflow the visible area.
                 let max_rows = (node.label_rows as i32).min(abs_h);
                 if max_rows < 1 {
                     continue;
@@ -617,39 +559,34 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
                 let pulse = app.tile_pulse(&node.target);
                 let bg = tile_color(node.color, selected, pulse);
                 let fg = readable_fg(bg);
-                let primary_mod = if node.is_folder {
-                    Modifier::BOLD
+                let primary = if node.is_folder {
+                    Style::new().fg(fg).bold()
                 } else {
-                    Modifier::empty()
+                    Style::new().fg(fg)
                 };
-                write_row(
-                    buf,
+                write_row_abs(
+                    slice,
                     &truncate(&node.name, abs_w as usize),
-                    fg,
-                    primary_mod,
+                    primary,
                     abs_x,
                     abs_y,
                     abs_w,
                 );
-                // Subtitle rows only render when the band reserved enough
-                // space *and* the unmodified text fits the tile width.
                 if max_rows >= 2 && (node.subtitle1.chars().count() as i32) <= abs_w {
-                    write_row(
-                        buf,
+                    write_row_abs(
+                        slice,
                         &node.subtitle1,
-                        fg,
-                        Modifier::empty(),
+                        Style::new().fg(fg),
                         abs_x,
                         abs_y + 1,
                         abs_w,
                     );
                 }
                 if max_rows >= 3 && !node.subtitle2.is_empty() {
-                    write_row(
-                        buf,
+                    write_row_abs(
+                        slice,
                         &truncate(&node.subtitle2, abs_w as usize),
-                        fg,
-                        Modifier::DIM,
+                        Style::new().fg(fg).dim(),
                         abs_x,
                         abs_y + 2,
                         abs_w,
@@ -657,18 +594,16 @@ fn render_nested(f: &mut Frame, inner: Rect, app: &mut App) {
                 }
             }
 
-            // Hit regions in node order: parents first, children last. App.hit()
-            // iterates in reverse so the deepest tile under the cursor wins.
             for node in nodes.iter() {
                 let r = node.rect;
-                let cy0 = r.y as i32 / 2;
-                let cy1 = (r.y as i32 + r.height as i32 + 1) / 2;
-                let cell_rect = Rect {
-                    x: (inner.x as i32 + r.x as i32).max(0) as u16,
-                    y: (inner.y as i32 + cy0).max(0) as u16,
-                    width: r.width,
-                    height: (cy1 - cy0).max(0) as u16,
-                };
+                let cy0 = r.top as i32 / 2;
+                let cy1 = (r.top as i32 + r.height as i32 + 1) / 2;
+                let cell_rect = Rect::new(
+                    (inner.top as i32 + cy0).max(0) as u16,
+                    (inner.left as i32 + r.left as i32).max(0) as u16,
+                    r.width,
+                    (cy1 - cy0).max(0) as u16,
+                );
                 if cell_rect.width == 0 || cell_rect.height == 0 {
                     continue;
                 }
@@ -698,15 +633,8 @@ fn build_nested(
     );
 }
 
-/// Sub-rows the folder reserves at the bottom of its rect for children
-/// to peek out from under the label band.
 const FOLDER_BOTTOM_PAD: u16 = 1;
 
-/// Build-time decision for a folder's label area: picks bitmap scale
-/// (or `None` = no bitmap), how many plain-text rows to emit (0 = none,
-/// 1 = name), and how tall the band reserved at the top of the folder
-/// is in sub-rows. Children get whatever's left below `band_subrows`
-/// (minus the bottom pad).
 fn folder_label_info(
     rect: Rect,
     name: &str,
@@ -729,8 +657,6 @@ fn folder_label_info(
             return (Some(scale), 0, band);
         }
     }
-    // Plain text fallback: one character row (= 2 sub-rows) plus the
-    // top sub-row pad and the bottom pad.
     let plain_band = NESTED_BAND_PAD_SUBROWS + 2;
     if rect.height >= plain_band + FOLDER_BOTTOM_PAD {
         return (None, 1, plain_band);
@@ -749,11 +675,6 @@ fn build_nested_at(
     max_scale: u16,
     out: &mut Vec<NestedNode>,
 ) {
-    // The outermost call (depth 0) doesn't draw a folder of its own — it
-    // just hosts the squarified children — so it skips the pad/label band
-    // entirely and uses the whole rect. For inner folders the band is
-    // sized by the parent's `folder_label_layout` and passed in via
-    // `band_subrows`.
     let (side_pad, top_band, bottom_pad) = if depth == 0 {
         (0, 0, 0)
     } else {
@@ -762,14 +683,13 @@ fn build_nested_at(
     if rect.width <= 2 * side_pad || rect.height <= top_band + bottom_pad {
         return;
     }
-    let inner = Rect {
-        x: rect.x + side_pad,
-        y: rect.y + top_band,
-        width: rect.width - 2 * side_pad,
-        height: rect.height - top_band - bottom_pad,
-    };
+    let inner = Rect::new(
+        rect.top + top_band,
+        rect.left + side_pad,
+        rect.width - 2 * side_pad,
+        rect.height - top_band - bottom_pad,
+    );
 
-    // Children with non-zero size, sorted by lines desc for the squarifier.
     let mut entries: Vec<(&str, &Node, u64)> = folder
         .children
         .iter()
@@ -789,10 +709,6 @@ fn build_nested_at(
     if entries.is_empty() {
         return;
     }
-    // Iterative squarify (same approach as the flat view): drop tiles that
-    // round below MIN_TILE_SUBCELLS and re-squarify the survivors so they
-    // expand into the freed space. Without this, dropped tiles leave large
-    // empty patches showing the parent's colour.
     let mut excluded = vec![false; entries.len()];
     let mut excluded_count: usize = 0;
     let mut tiles: Vec<treemap::Tile<usize>> = Vec::new();
@@ -848,30 +764,20 @@ fn build_nested_at(
                     subtitle1: fmt_compact(f.lines),
                     subtitle2: String::new(),
                     is_folder: false,
-                    // A file has no children, so any character row inside
-                    // its rect is fair game for its label.
                     label_rows: 2,
-                    // Files pick a bitmap scale dynamically per frame
-                    // inside `render_nested` — leave `None` here.
                     bitmap_scale: None,
                 });
             }
             Node::Folder(sub) => {
                 let mut sub_path = base_path.to_vec();
                 sub_path.push(name.to_string());
-                let base = sub
-                    .dominant_lang()
-                    .map(lang::color)
-                    .unwrap_or(Color::Rgb(120, 120, 120));
-                // Darken folders so their leaf children pop against the
-                // container, even when everything inside is the same
-                // language. Deeper nesting darkens further (capped) so the
-                // hierarchy reads as a depth gradient.
+                let base = sub.dominant_lang().map(lang::color).unwrap_or(Color::Rgb {
+                    r: 120,
+                    g: 120,
+                    b: 120,
+                });
                 let darken_amt = (0.35 + 0.10 * depth as f64).min(0.70);
                 let color = darken(base, darken_amt);
-                // Folders show only their name — size and child count are
-                // already communicated visually by the tile area and the
-                // children inside it.
                 let display_name = format!("{name}/");
                 let (bitmap_scale, label_rows, child_band) =
                     folder_label_info(r, &display_name, bitmap_enabled, max_scale);
@@ -886,12 +792,6 @@ fn build_nested_at(
                     label_rows,
                     bitmap_scale,
                 });
-                // Cascading cap: children may not pick a scale larger
-                // than the parent's chosen scale, so a deeper subfolder
-                // never out-shouts its parent visually. If the parent
-                // fell back to plain text, disable bitmap labels on its
-                // descendants entirely — even scale 1 is taller than a
-                // single character row.
                 let (child_bitmap_enabled, child_max_scale) = match bitmap_scale {
                     Some(s) => (bitmap_enabled, s),
                     None => (false, 0),
@@ -911,8 +811,6 @@ fn build_nested_at(
     }
 }
 
-/// Iterative squarified layout. Re-runs after dropping any tile that rounds
-/// below `MIN_TILE_SUBCELLS` so the remaining tiles redistribute the space.
 fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::Tile<usize>> {
     let _g = crate::perf::begin("ui.halfblock.layout");
     let cols = inner.width;
@@ -924,12 +822,7 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
         return Vec::new();
     }
 
-    let layout_area = Rect {
-        x: 0,
-        y: 0,
-        width: cols,
-        height: sub_rows,
-    };
+    let layout_area = Rect::new(0, 0, cols, sub_rows);
     let cell_value = total_value as f64 / area_subcells as f64;
     let pre_min = (cell_value * (MIN_TILE_SUBCELLS as f64).powi(2)).max(1.0);
 
@@ -1015,9 +908,6 @@ fn record_layout_bench(
     app.bench.last_tiles_drawn = drawn;
 }
 
-/// Fill the colour grid for each tile, shrinking by GAP_SUBCELLS on right
-/// and bottom. Returns the visible (post-gap) sub-cell rect per tile, used
-/// for the text-overlay pass.
 fn rasterize_tiles(
     items: &[TileItem],
     tiles: &[treemap::Tile<usize>],
@@ -1041,10 +931,10 @@ fn rasterize_tiles(
         let pulse = app.tile_pulse(&item.target);
         let color = tile_color(item.color, selected, pulse);
 
-        let sx_end = (r.x + r.width).min(cols as u16);
-        let sy_end = (r.y + r.height).min(sub_rows as u16);
-        for sy in r.y..sy_end {
-            for sx in r.x..sx_end {
+        let sx_end = (r.left + r.width).min(cols as u16);
+        let sy_end = (r.top + r.height).min(sub_rows as u16);
+        for sy in r.top..sy_end {
+            for sx in r.left..sx_end {
                 grid[sy as usize * cols + sx as usize] = Some(color);
             }
         }
@@ -1052,34 +942,48 @@ fn rasterize_tiles(
     }
 }
 
-/// Render the colour grid as half-block characters: each character row pulls
-/// its top half from sub-row `2*y` and its bottom half from sub-row `2*y+1`.
-fn composite_halfblocks(buf: &mut Buffer, inner: Rect, grid: &[Option<Color>], cols: usize) {
+/// Render the colour grid as half-block characters into the slice.
+/// `inner` is in screen-coordinates; we translate to slice-local coords
+/// before writing each cell.
+fn composite_halfblocks(
+    slice: &mut GridSlice<'_>,
+    inner: Rect,
+    grid: &[Option<Color>],
+    cols: usize,
+) {
     let _g = crate::perf::begin("ui.halfblock.fill");
+    let slice_origin = slice.screen_rect();
+    let local_x0 = inner.left.saturating_sub(slice_origin.left);
+    let local_y0 = inner.top.saturating_sub(slice_origin.top);
     for cy in 0..(inner.height as usize) {
         for cx in 0..cols {
             let top = grid[(cy * 2) * cols + cx];
             let bot = grid[(cy * 2 + 1) * cols + cx];
-            let abs_x = inner.x + cx as u16;
-            let abs_y = inner.y + cy as u16;
-            let Some(cell) = buf.cell_mut(Position::new(abs_x, abs_y)) else {
+            let lx = local_x0 + cx as u16;
+            let ly = local_y0 + cy as u16;
+            let Some(cell) = slice.cell_mut(lx, ly) else {
                 continue;
             };
             match (top, bot) {
                 (Some(t), Some(b)) if t == b => {
-                    cell.set_symbol(" ").set_bg(t);
+                    cell.symbol = ' ';
+                    cell.style = Style::default().bg(t);
                 }
                 (Some(t), Some(b)) => {
-                    cell.set_symbol("▀").set_fg(t).set_bg(b);
+                    cell.symbol = '▀';
+                    cell.style = Style::default().fg(t).bg(b);
                 }
                 (Some(t), None) => {
-                    cell.set_symbol("▀").set_fg(t).set_bg(Color::Reset);
+                    cell.symbol = '▀';
+                    cell.style = Style::default().fg(t).bg(Color::Reset);
                 }
                 (None, Some(b)) => {
-                    cell.set_symbol("▄").set_fg(b).set_bg(Color::Reset);
+                    cell.symbol = '▄';
+                    cell.style = Style::default().fg(b).bg(Color::Reset);
                 }
                 (None, None) => {
-                    cell.set_symbol(" ").set_bg(Color::Reset);
+                    cell.symbol = ' ';
+                    cell.style = Style::default().bg(Color::Reset);
                 }
             }
         }
@@ -1087,7 +991,7 @@ fn composite_halfblocks(buf: &mut Buffer, inner: Rect, grid: &[Option<Color>], c
 }
 
 fn overlay_labels(
-    buf: &mut Buffer,
+    slice: &mut GridSlice<'_>,
     inner: Rect,
     visible: &[(Rect, usize)],
     items: &[TileItem],
@@ -1100,15 +1004,13 @@ fn overlay_labels(
         if scaled_painted.get(i).copied().unwrap_or(false) {
             continue;
         }
-        // Pixel rows fully inside the tile (both top and bottom sub-cells
-        // belong to the tile, not to the gap).
-        let y_start = (r.y as i32 + 1) / 2;
-        let y_end = (r.y as i32 + r.height as i32) / 2;
+        let y_start = (r.top as i32 + 1) / 2;
+        let y_end = (r.top as i32 + r.height as i32) / 2;
         if y_end <= y_start {
             continue;
         }
-        let abs_x0 = inner.x as i32 + r.x as i32;
-        let abs_y0 = inner.y as i32 + y_start;
+        let abs_x0 = inner.left as i32 + r.left as i32;
+        let abs_y0 = inner.top as i32 + y_start;
         let abs_w = r.width as i32;
         let abs_h = y_end - y_start;
         if abs_w <= 0 || abs_h <= 0 {
@@ -1118,12 +1020,9 @@ fn overlay_labels(
         let selected = app.selected.as_ref() == Some(&item.target);
         let pulse = app.tile_pulse(&item.target);
         let bg = tile_color(item.color, selected, pulse);
-        write_label(buf, item, bg, abs_x0, abs_y0, abs_w, abs_h);
+        write_label(slice, item, bg, abs_x0, abs_y0, abs_w, abs_h);
     }
     if app.bench.enabled {
-        // Text overlay only — caller records the half-block fill duration
-        // separately via the perf guard.
-        // (last_text_overlay is captured by the outer measure_*.)
         let _ = t0;
     }
 }
@@ -1139,22 +1038,17 @@ fn record_hit_regions(
         if r.width <= GAP_SUBCELLS || r.height <= GAP_SUBCELLS {
             continue;
         }
-        let visible_r = Rect {
-            x: r.x,
-            y: r.y,
-            width: r.width - GAP_SUBCELLS,
-            height: r.height - GAP_SUBCELLS,
-        };
-        let cy0 = visible_r.y as i32 / 2;
-        let cy1 = (visible_r.y as i32 + visible_r.height as i32 + 1) / 2;
-        let cx0 = visible_r.x as i32;
-        let cx1 = visible_r.x as i32 + visible_r.width as i32;
-        let abs = Rect {
-            x: (inner.x as i32 + cx0).max(0) as u16,
-            y: (inner.y as i32 + cy0).max(0) as u16,
-            width: (cx1 - cx0).max(0) as u16,
-            height: (cy1 - cy0).max(0) as u16,
-        };
+        let visible_r = Rect::new(r.top, r.left, r.width - GAP_SUBCELLS, r.height - GAP_SUBCELLS);
+        let cy0 = visible_r.top as i32 / 2;
+        let cy1 = (visible_r.top as i32 + visible_r.height as i32 + 1) / 2;
+        let cx0 = visible_r.left as i32;
+        let cx1 = visible_r.left as i32 + visible_r.width as i32;
+        let abs = Rect::new(
+            (inner.top as i32 + cy0).max(0) as u16,
+            (inner.left as i32 + cx0).max(0) as u16,
+            (cx1 - cx0).max(0) as u16,
+            (cy1 - cy0).max(0) as u16,
+        );
         if abs.width == 0 || abs.height == 0 {
             continue;
         }
@@ -1162,50 +1056,88 @@ fn record_hit_regions(
     }
 }
 
-fn write_label(buf: &mut Buffer, item: &TileItem, bg: Color, x: i32, y: i32, w: i32, h: i32) {
+fn write_label(
+    slice: &mut GridSlice<'_>,
+    item: &TileItem,
+    bg: Color,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
     if w < 3 || h < 1 {
         return;
     }
     let fg = readable_fg(bg);
-    write_row(
-        buf,
+    write_row_abs(
+        slice,
         &truncate(&item.name, w as usize),
-        fg,
-        Modifier::BOLD,
+        Style::new().fg(fg).bold(),
         x,
         y,
         w,
     );
     if h >= 2 && (item.subtitle1.chars().count() as i32) <= w {
-        write_row(buf, &item.subtitle1, fg, Modifier::empty(), x, y + 1, w);
+        write_row_abs(slice, &item.subtitle1, Style::new().fg(fg), x, y + 1, w);
     }
     if h >= 3 && !item.subtitle2.is_empty() {
         let s = truncate_left(&item.subtitle2, w as usize);
-        write_row(buf, &s, fg, Modifier::DIM, x, y + 2, w);
+        write_row_abs(slice, &s, Style::new().fg(fg).dim(), x, y + 2, w);
     }
 }
 
-fn write_row(buf: &mut Buffer, text: &str, fg: Color, modifier: Modifier, x: i32, y: i32, w: i32) {
+/// Write `text` into the grid at *screen-absolute* `(x, y)` clipped to
+/// the slice's underlying width-`w` window. Negative coords are clipped
+/// (each char advances `col`); chars past `x + w` stop the loop.
+///
+/// Preserves the existing cell's `bg` when `style.bg` is `None`, so
+/// labels painted over a coloured half-block tile inherit the tile's
+/// background instead of resetting it to the terminal default. Mirrors
+/// ratatui's `cell.set_char(ch).set_fg(fg)` partial-update behaviour.
+fn write_row_abs(slice: &mut GridSlice<'_>, text: &str, style: Style, x: i32, y: i32, w: i32) {
+    let origin = slice.screen_rect();
     if y < 0 {
         return;
     }
-    let mut col = x;
-    for ch in text.chars() {
-        if col >= x + w {
+    let local_y = y - origin.top as i32;
+    if local_y < 0 || local_y >= slice.height() as i32 {
+        return;
+    }
+    for (offset, ch) in text.chars().enumerate() {
+        if offset as i32 >= w {
             break;
         }
+        let col = x + offset as i32;
         if col < 0 {
-            col += 1;
             continue;
         }
-        if let Some(cell) = buf.cell_mut(Position::new(col as u16, y as u16)) {
-            cell.set_char(ch).set_fg(fg);
-            if !modifier.is_empty() {
-                cell.set_style(Style::default().add_modifier(modifier));
+        let local_x = col - origin.left as i32;
+        if local_x >= 0 && local_x < slice.width() as i32
+            && let Some(cell) = slice.cell_mut(local_x as u16, local_y as u16)
+        {
+            cell.symbol = ch;
+            let mut new_style = style;
+            if new_style.bg.is_none() {
+                new_style.bg = cell.style.bg;
             }
+            cell.style = new_style;
         }
+    }
+}
+
+/// Slice-local `put_str` returning the next column. Stops at the right
+/// edge so callers can chain spans without re-checking bounds.
+fn put_str_clip(slice: &mut GridSlice<'_>, x: u16, y: u16, text: &str, style: Style) -> u16 {
+    let mut col = x;
+    let w = slice.width();
+    for ch in text.chars() {
+        if col >= w {
+            break;
+        }
+        slice.set(col, y, ch, style);
         col += 1;
     }
+    col
 }
 
 // ── item building (tree / files view) ───────────────────────────────────────
@@ -1217,8 +1149,6 @@ fn build_items_into(app: &App, out: &mut Vec<TileItem>) {
     match app.view {
         View::Tree => build_tree_items(app, folder, total, out),
         View::Files => build_files_items(app, folder, total, out),
-        // Nested goes through its own pipeline; render_treemap branches
-        // before calling build_items_into so this is unreachable.
         View::Nested => {}
     }
 }
@@ -1245,10 +1175,11 @@ fn build_tree_items(app: &App, folder: &FolderNode, total: u64, out: &mut Vec<Ti
                 if sub.total_lines == 0 {
                     continue;
                 }
-                let color = sub
-                    .dominant_lang()
-                    .map(lang::color)
-                    .unwrap_or(Color::Rgb(120, 120, 120));
+                let color = sub.dominant_lang().map(lang::color).unwrap_or(Color::Rgb {
+                    r: 120,
+                    g: 120,
+                    b: 120,
+                });
                 let pct = 100.0 * sub.total_lines as f64 / total as f64;
                 let mut path = app.current_path.clone();
                 path.push(name.clone());
@@ -1265,10 +1196,6 @@ fn build_tree_items(app: &App, folder: &FolderNode, total: u64, out: &mut Vec<Ti
     }
 }
 
-// Cap how many file items we materialize for the Files view. The treemap
-// can only render a few hundred tiles before they round below the minimum
-// sub-cell size; building strings for the long tail is wasted work and
-// dominates frame time on large trees.
 const MAX_FILE_ITEMS: usize = 8192;
 
 fn build_files_items(app: &App, folder: &FolderNode, total: u64, out: &mut Vec<TileItem>) {
@@ -1308,16 +1235,17 @@ fn build_files_items(app: &App, folder: &FolderNode, total: u64, out: &mut Vec<T
 
 // ── legend ──────────────────────────────────────────────────────────────────
 
-fn render_legend(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_legend(slice: &mut GridSlice<'_>, app: &mut App) {
     let _g = crate::perf::begin("ui.legend");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(Span::styled(
-            " languages ",
-            Style::default().fg(Color::White),
-        )));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+
+    if slice.width() == 0 || slice.height() == 0 {
+        return;
+    }
+
+    // Slice already lives inside the layout-tree-painted border; its
+    // screen_rect is the inner area. Tracked on `App` so the host's
+    // mouse handler can detect wheel events inside the legend.
+    let inner = slice.screen_rect();
     app.legend_rect = inner;
 
     app.ensure_ranked();
@@ -1334,51 +1262,62 @@ fn render_legend(f: &mut Frame, area: Rect, app: &mut App) {
     let scroll = app.legend_scroll;
     let ranked = app.ranked();
 
-    let mut lines: Vec<Line> = Vec::with_capacity(body_capacity + 1);
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:<14}", "language"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("{:>6}", "files"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("{:>8}", "lines"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(format!("{:>5}", "%"), Style::default().fg(Color::DarkGray)),
-    ]));
+    // Header row (slice-local row 1, since outer border is row 0).
+    let dim = Style::new().fg(Color::DarkGrey);
+    let header_y: u16 = 1;
+    let mut col: u16 = 1;
+    col = put_str_clip(slice, col, header_y, &format!("{:<14}", "language"), dim);
+    col = put_str_clip(slice, col, header_y, &format!("{:>6}", "files"), dim);
+    col = put_str_clip(slice, col, header_y, &format!("{:>8}", "lines"), dim);
+    let _ = put_str_clip(slice, col, header_y, &format!("{:>5}", "%"), dim);
 
-    for (lang_, stats) in ranked.iter().skip(scroll).take(body_capacity) {
+    for (row_idx, (lang_, stats)) in ranked.iter().skip(scroll).take(body_capacity).enumerate() {
         let pct = 100.0 * stats.lines as f64 / total as f64;
-        let line = Line::from(vec![
-            Span::styled("██ ", Style::default().fg(lang::color(*lang_))),
-            Span::raw(format!("{:<11}", truncate(lang_.0, 11))),
-            Span::raw(format!("{:>6}", fmt_compact(stats.files))),
-            Span::raw(format!("{:>8}", fmt_compact(stats.lines))),
-            Span::styled(
-                format!("{:>5}", fmt_pct(pct)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        lines.push(line);
+        let y: u16 = header_y + 1 + row_idx as u16;
+        if y >= slice.height() - 1 {
+            break;
+        }
+        let mut col: u16 = 1;
+        col = put_str_clip(slice, col, y, "██ ", Style::new().fg(lang::color(*lang_)));
+        col = put_str_clip(
+            slice,
+            col,
+            y,
+            &format!("{:<11}", truncate(lang_.0, 11)),
+            Style::default(),
+        );
+        col = put_str_clip(
+            slice,
+            col,
+            y,
+            &format!("{:>6}", fmt_compact(stats.files)),
+            Style::default(),
+        );
+        col = put_str_clip(
+            slice,
+            col,
+            y,
+            &format!("{:>8}", fmt_compact(stats.lines)),
+            Style::default(),
+        );
+        let _ = put_str_clip(slice, col, y, &format!("{:>5}", fmt_pct(pct)), dim);
     }
-
-    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── colour helpers ──────────────────────────────────────────────────────────
 
 fn brighten(c: Color, amount: f64) -> Color {
     match c {
-        Color::Rgb(r, g, b) => {
+        Color::Rgb { r, g, b } => {
             let f = amount.clamp(0.0, 1.0);
             let nr = r as f64 + (255.0 - r as f64) * f;
             let ng = g as f64 + (255.0 - g as f64) * f;
             let nb = b as f64 + (255.0 - b as f64) * f;
-            Color::Rgb(nr as u8, ng as u8, nb as u8)
+            Color::Rgb {
+                r: nr as u8,
+                g: ng as u8,
+                b: nb as u8,
+            }
         }
         _ => c,
     }
@@ -1386,13 +1325,13 @@ fn brighten(c: Color, amount: f64) -> Color {
 
 fn darken(c: Color, amount: f64) -> Color {
     match c {
-        Color::Rgb(r, g, b) => {
+        Color::Rgb { r, g, b } => {
             let f = (1.0 - amount).clamp(0.0, 1.0);
-            Color::Rgb(
-                (r as f64 * f) as u8,
-                (g as f64 * f) as u8,
-                (b as f64 * f) as u8,
-            )
+            Color::Rgb {
+                r: (r as f64 * f) as u8,
+                g: (g as f64 * f) as u8,
+                b: (b as f64 * f) as u8,
+            }
         }
         _ => c,
     }
@@ -1400,7 +1339,7 @@ fn darken(c: Color, amount: f64) -> Color {
 
 fn readable_fg(bg: Color) -> Color {
     let (r, g, b) = match bg {
-        Color::Rgb(r, g, b) => (r as f64, g as f64, b as f64),
+        Color::Rgb { r, g, b } => (r as f64, g as f64, b as f64),
         _ => return Color::White,
     };
     let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
