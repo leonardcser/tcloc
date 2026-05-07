@@ -2,10 +2,8 @@ use std::cell::RefCell;
 use std::io::Write;
 
 use smelt_term::grid::{Color, GridSlice, Style};
-use smelt_term::{
-    Border, Constraint, LayoutTree, Line, PaintId, Rect, Span, Surface,
-};
 use smelt_term::layout::BorderStyle;
+use smelt_term::{Border, Constraint, LayoutTree, Line, PaintId, Rect, Span, Surface};
 
 use crate::app::{App, TileTarget, View};
 use crate::bitmap_font;
@@ -43,11 +41,8 @@ fn tile_color(base: Color, selected: bool, pulse: f32) -> Color {
     c
 }
 
-const SCALE_MIN_AREA_CELLS: [(u16, u16); bitmap_font::MAX_SCALE as usize] = [
-    (80, 24),
-    (220, 64),
-    (260, 76),
-];
+const SCALE_MIN_AREA_CELLS: [(u16, u16); bitmap_font::MAX_SCALE as usize] =
+    [(80, 24), (220, 64), (260, 76)];
 const LABEL_MAX_TILE_FRAC_NUM: u16 = 3;
 const LABEL_MAX_TILE_FRAC_DEN: u16 = 5;
 
@@ -146,8 +141,7 @@ pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::
     let mut items = vec![
         (
             Constraint::Length(2),
-            LayoutTree::leaf(PAINT_HEADER)
-                .with_border(Border::bottom(BorderStyle::Single)),
+            LayoutTree::leaf(PAINT_HEADER).with_border(Border::bottom(BorderStyle::Single)),
         ),
         (
             Constraint::Fill,
@@ -160,8 +154,8 @@ pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::
                 ),
                 (
                     // 33 cells of content (3 + 11 + 6 + 8 + 5) + 2 for
-                    // the side borders + 1 cell of right padding.
-                    Constraint::Length(36),
+                    // the side borders.
+                    Constraint::Length(35),
                     LayoutTree::leaf(PAINT_LEGEND)
                         .with_border(Border::SINGLE)
                         .with_title(" languages "),
@@ -425,8 +419,7 @@ fn render_flat(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
                             let fg = readable_fg(bg);
                             let label_w = bitmap_font::label_width(&item.name, scale);
                             let label_h = bitmap_font::label_height(scale);
-                            let x0 =
-                                r.left as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
+                            let x0 = r.left as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
                             let y0 = r.top as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32;
                             bitmap_font::paint(
                                 &mut grid, cols, sub_rows, x0, y0, &item.name, fg, scale,
@@ -452,7 +445,14 @@ fn render_nested(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
     }
     let cols = inner.width as usize;
     let sub_rows = (inner.height as usize) * 2;
-    let root_rect = Rect::new(0, 0, inner.width, sub_rows as u16);
+    // Inflated root area so edge tiles (after the gap shrink in
+    // build_nested_at) reach exactly to the panel boundary.
+    let root_rect = Rect::new(
+        0,
+        0,
+        inner.width + GAP_SUBCELLS,
+        sub_rows as u16 + GAP_SUBCELLS,
+    );
 
     let bitmap_on = bitmap_enabled(inner);
     NESTED_BUF.with(|n| {
@@ -824,7 +824,11 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
         return Vec::new();
     }
 
-    let layout_area = Rect::new(0, 0, cols, sub_rows);
+    // Inflate the layout area by one gutter on the right and bottom so
+    // the edge tiles, after their per-tile gap shrink in rasterize_tiles,
+    // snap back exactly to the panel boundary instead of leaving a dead
+    // column / half-row of empty space.
+    let layout_area = Rect::new(0, 0, cols + GAP_SUBCELLS, sub_rows + GAP_SUBCELLS);
     let cell_value = total_value as f64 / area_subcells as f64;
     let pre_min = (cell_value * (MIN_TILE_SUBCELLS as f64).powi(2)).max(1.0);
 
@@ -1040,7 +1044,12 @@ fn record_hit_regions(
         if r.width <= GAP_SUBCELLS || r.height <= GAP_SUBCELLS {
             continue;
         }
-        let visible_r = Rect::new(r.top, r.left, r.width - GAP_SUBCELLS, r.height - GAP_SUBCELLS);
+        let visible_r = Rect::new(
+            r.top,
+            r.left,
+            r.width - GAP_SUBCELLS,
+            r.height - GAP_SUBCELLS,
+        );
         let cy0 = visible_r.top as i32 / 2;
         let cy1 = (visible_r.top as i32 + visible_r.height as i32 + 1) / 2;
         let cx0 = visible_r.left as i32;
@@ -1114,7 +1123,8 @@ fn write_row_abs(slice: &mut GridSlice<'_>, text: &str, style: Style, x: i32, y:
             continue;
         }
         let local_x = col - origin.left as i32;
-        if local_x >= 0 && local_x < slice.width() as i32
+        if local_x >= 0
+            && local_x < slice.width() as i32
             && let Some(cell) = slice.cell_mut(local_x as u16, local_y as u16)
         {
             cell.symbol = ch;
@@ -1271,8 +1281,7 @@ fn render_legend(slice: &mut GridSlice<'_>, app: &mut App) {
     let mut col: u16 = 0;
     col = put_str_clip(slice, col, header_y, &format!("{:<14}", "language"), dim);
     col = put_str_clip(slice, col, header_y, &format!("{:>6}", "files"), dim);
-    col = put_str_clip(slice, col, header_y, &format!("{:>8}", "lines"), dim);
-    let _ = put_str_clip(slice, col, header_y, &format!("{:>5}", "%"), dim);
+    let _ = put_str_clip(slice, col, header_y, &format!("{:>8}", "lines"), dim);
 
     for (row_idx, (lang_, stats)) in ranked.iter().skip(scroll).take(body_capacity).enumerate() {
         let pct = 100.0 * stats.lines as f64 / total as f64;
