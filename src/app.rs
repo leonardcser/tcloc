@@ -190,7 +190,7 @@ impl App {
     }
 
     pub fn record(&mut self, path: PathBuf, lang: Lang, lines: u64, bytes: u64, count_nanos: u64) {
-        let _g = crate::perf::begin("app.record");
+        let _g = smelt_perf::perf::begin("app.record");
         if self.bench.enabled {
             self.bench.total_count_nanos += count_nanos as u128;
             if count_nanos > self.bench.max_count_nanos {

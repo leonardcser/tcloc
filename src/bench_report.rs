@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
-use crate::alloc_track::AllocStats;
 use crate::app::App;
 use crate::format::{fmt_bytes, fmt_int};
+use smelt_perf::alloc::AllocStats;
 
 pub fn print(
     app: &App,

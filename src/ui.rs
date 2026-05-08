@@ -118,7 +118,7 @@ struct TileItem {
 // ── top-level layout / dispatch ─────────────────────────────────────────────
 
 pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::Result<()> {
-    let _g = crate::perf::begin("ui.render");
+    let _g = smelt_perf::perf::begin("ui.render");
     app.gc_pulses();
 
     // Build the splits layout for this frame. Header (2 = 1 content +
@@ -139,37 +139,41 @@ pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::
             "(area = lines, color = language) ",
             Style::new().fg(Color::DarkGrey),
         ));
-    let mut items = vec![
-        (
-            Constraint::Length(2),
-            LayoutTree::leaf(PAINT_HEADER).with_border(Border::bottom(BorderStyle::Single)),
-        ),
-        (
-            Constraint::Fill,
-            LayoutTree::hbox(vec![
-                (
-                    Constraint::Fill,
-                    LayoutTree::leaf(PAINT_TREEMAP)
-                        .with_border(Border::SINGLE)
-                        .with_title(treemap_title),
-                ),
-                (
-                    // 33 cells of content (3 + 11 + 6 + 8 + 5) + 2 for
-                    // the side borders.
-                    Constraint::Length(35),
-                    LayoutTree::leaf(PAINT_LEGEND)
-                        .with_border(Border::SINGLE)
-                        .with_title(" languages "),
-                ),
-            ]),
-        ),
-    ];
-    if app.bench.enabled {
-        items.push((Constraint::Length(1), LayoutTree::leaf(PAINT_BENCH)));
+    {
+        let _p = smelt_perf::perf::begin("ui.layout");
+        let mut items = vec![
+            (
+                Constraint::Length(2),
+                LayoutTree::leaf(PAINT_HEADER).with_border(Border::bottom(BorderStyle::Single)),
+            ),
+            (
+                Constraint::Fill,
+                LayoutTree::hbox(vec![
+                    (
+                        Constraint::Fill,
+                        LayoutTree::leaf(PAINT_TREEMAP)
+                            .with_border(Border::SINGLE)
+                            .with_title(treemap_title),
+                    ),
+                    (
+                        // 33 cells of content (3 + 11 + 6 + 8 + 5) + 2 for
+                        // the side borders.
+                        Constraint::Length(35),
+                        LayoutTree::leaf(PAINT_LEGEND)
+                            .with_border(Border::SINGLE)
+                            .with_title(" languages "),
+                    ),
+                ]),
+            ),
+        ];
+        if app.bench.enabled {
+            items.push((Constraint::Length(1), LayoutTree::leaf(PAINT_BENCH)));
+        }
+        items.push((Constraint::Length(1), LayoutTree::leaf(PAINT_FOOTER)));
+        ui.set_layout(LayoutTree::vbox(items));
     }
-    items.push((Constraint::Length(1), LayoutTree::leaf(PAINT_FOOTER)));
-    ui.set_layout(LayoutTree::vbox(items));
 
+    let _p = smelt_perf::perf::begin("ui.render_flush");
     ui.render(w, |id, slice, _ctx| match id {
         PAINT_HEADER => render_header(slice, app),
         PAINT_TREEMAP => render_treemap(slice, app),
@@ -183,7 +187,7 @@ pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::
 // ── chrome (header / footer / bench HUD) ────────────────────────────────────
 
 fn render_header(slice: &mut GridSlice<'_>, app: &App) {
-    let _g = crate::perf::begin("ui.header");
+    let _g = smelt_perf::perf::begin("ui.header");
     let (status_text, status_bg) = if !app.done {
         (" SCANNING ", Color::Yellow)
     } else if app.watching {
@@ -226,6 +230,7 @@ fn render_header(slice: &mut GridSlice<'_>, app: &App) {
 }
 
 fn render_footer(slice: &mut GridSlice<'_>, app: &App) {
+    let _g = smelt_perf::perf::begin("ui.footer");
     let path = app
         .last_path
         .as_ref()
@@ -251,6 +256,7 @@ fn render_footer(slice: &mut GridSlice<'_>, app: &App) {
 }
 
 fn render_bench_hud(slice: &mut GridSlice<'_>, app: &App) {
+    let _g = smelt_perf::perf::begin("ui.bench_hud");
     let elapsed = app.elapsed_secs().max(0.001);
     let files_per_s = app.total_files as f64 / elapsed;
     let lines_per_s = app.total_lines as f64 / elapsed;
@@ -352,7 +358,7 @@ fn render_bench_hud(slice: &mut GridSlice<'_>, app: &App) {
 // ── treemap ─────────────────────────────────────────────────────────────────
 
 fn render_treemap(slice: &mut GridSlice<'_>, app: &mut App) {
-    let _g = crate::perf::begin("ui.treemap");
+    let _g = smelt_perf::perf::begin("ui.treemap");
 
     if slice.width() == 0 || slice.height() == 0 {
         app.last_tiles.clear();
@@ -395,7 +401,10 @@ fn render_flat(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
                 if !cache_hit {
                     layout_tiles_into(&buf, inner, app, &mut tiles);
                     visible.clear();
-                    compute_visible_into(&tiles, &mut visible);
+                    {
+                        let _p = smelt_perf::perf::begin("ui.flat.visible");
+                        compute_visible_into(&tiles, &mut visible);
+                    }
                     app.last_tiles.clear();
                     record_hit_regions(&tiles, &buf, inner, &mut app.last_tiles);
                     app.last_flat_key = Some(cache_key);
@@ -410,14 +419,17 @@ fn render_flat(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
                     let mut grid = g.borrow_mut();
                     grid.clear();
                     grid.resize(cols * sub_rows, None);
-                    paint_visible_into_grid(&visible, &buf, &mut grid, cols, sub_rows, app);
+                    {
+                        let _p = smelt_perf::perf::begin("ui.flat.paint_grid");
+                        paint_visible_into_grid(&visible, &buf, &mut grid, cols, sub_rows, app);
+                    }
 
                     SCALED_PAINTED_BUF.with(|sp| {
                         let mut scaled_painted = sp.borrow_mut();
                         scaled_painted.clear();
                         scaled_painted.resize(visible.len(), false);
 
-                        let _g = crate::perf::begin("ui.bitmap_labels");
+                        let _g = smelt_perf::perf::begin("ui.bitmap_labels");
                         if bitmap_enabled(inner) {
                             let max_scale = max_label_scale(inner);
                             for (i, (r, idx)) in visible.iter().enumerate() {
@@ -477,7 +489,7 @@ fn render_nested(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
         let layout_t0 = std::time::Instant::now();
         let cache_hit = app.last_nested_key == Some(cache_key) && !nodes.is_empty();
         if !cache_hit {
-            let _g = crate::perf::begin("ui.nested.build");
+            let _g = smelt_perf::perf::begin("ui.nested.build");
             nodes.clear();
             build_nested(
                 app.current_folder(),
@@ -505,21 +517,25 @@ fn render_nested(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
                 let mut grid = g.borrow_mut();
                 grid.clear();
                 grid.resize(cols * sub_rows, None);
-                for node in nodes.iter() {
-                    let selected = app.selected.as_ref() == Some(&node.target);
-                    let pulse = app.tile_pulse(&node.target);
-                    let color = tile_color(node.color, selected, pulse);
-                    let r = node.rect;
-                    let sx_end = (r.left + r.width).min(cols as u16);
-                    let sy_end = (r.top + r.height).min(sub_rows as u16);
-                    for sy in r.top..sy_end {
-                        let row_base = sy as usize * cols;
-                        for sx in r.left..sx_end {
-                            grid[row_base + sx as usize] = Some(color);
+                {
+                    let _p = smelt_perf::perf::begin("ui.nested.grid");
+                    for node in nodes.iter() {
+                        let selected = app.selected.as_ref() == Some(&node.target);
+                        let pulse = app.tile_pulse(&node.target);
+                        let color = tile_color(node.color, selected, pulse);
+                        let r = node.rect;
+                        let sx_end = (r.left + r.width).min(cols as u16);
+                        let sy_end = (r.top + r.height).min(sub_rows as u16);
+                        for sy in r.top..sy_end {
+                            let row_base = sy as usize * cols;
+                            for sx in r.left..sx_end {
+                                grid[row_base + sx as usize] = Some(color);
+                            }
                         }
                     }
                 }
                 if bitmap_on {
+                    let _p = smelt_perf::perf::begin("ui.nested.bitmap");
                     let max_scale = max_label_scale(inner);
                     for (i, node) in nodes.iter().enumerate() {
                         let r = node.rect;
@@ -550,73 +566,80 @@ fn render_nested(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
                         scaled_painted[i] = true;
                     }
                 }
-                composite_halfblocks(slice, inner, &grid, cols);
+                {
+                    let _p = smelt_perf::perf::begin("ui.nested.composite");
+                    composite_halfblocks(slice, inner, &grid, cols);
+                }
             });
 
-            for (i, node) in nodes.iter().enumerate() {
-                if scaled_painted[i] {
-                    continue;
-                }
-                if node.label_rows == 0 {
-                    continue;
-                }
-                let r = node.rect;
-                let y_start = (r.top as i32 + 1) / 2;
-                let y_end = (r.top as i32 + r.height as i32) / 2;
-                if y_end <= y_start {
-                    continue;
-                }
-                let abs_x = inner.left as i32 + r.left as i32;
-                let abs_y = inner.top as i32 + y_start;
-                let abs_w = r.width as i32;
-                let abs_h = y_end - y_start;
-                if abs_w < 3 || abs_h < 1 {
-                    continue;
-                }
-                let max_rows = (node.label_rows as i32).min(abs_h);
-                if max_rows < 1 {
-                    continue;
-                }
-                let selected = app.selected.as_ref() == Some(&node.target);
-                let pulse = app.tile_pulse(&node.target);
-                let bg = tile_color(node.color, selected, pulse);
-                let fg = readable_fg(bg);
-                let primary = if node.is_folder {
-                    Style::new().fg(fg).bold()
-                } else {
-                    Style::new().fg(fg)
-                };
-                write_row_abs(
-                    slice,
-                    &truncate(&node.name, abs_w as usize),
-                    primary,
-                    abs_x,
-                    abs_y,
-                    abs_w,
-                );
-                if max_rows >= 2 && (node.subtitle1.chars().count() as i32) <= abs_w {
+            {
+                let _p = smelt_perf::perf::begin("ui.nested.text");
+                for (i, node) in nodes.iter().enumerate() {
+                    if scaled_painted[i] {
+                        continue;
+                    }
+                    if node.label_rows == 0 {
+                        continue;
+                    }
+                    let r = node.rect;
+                    let y_start = (r.top as i32 + 1) / 2;
+                    let y_end = (r.top as i32 + r.height as i32) / 2;
+                    if y_end <= y_start {
+                        continue;
+                    }
+                    let abs_x = inner.left as i32 + r.left as i32;
+                    let abs_y = inner.top as i32 + y_start;
+                    let abs_w = r.width as i32;
+                    let abs_h = y_end - y_start;
+                    if abs_w < 3 || abs_h < 1 {
+                        continue;
+                    }
+                    let max_rows = (node.label_rows as i32).min(abs_h);
+                    if max_rows < 1 {
+                        continue;
+                    }
+                    let selected = app.selected.as_ref() == Some(&node.target);
+                    let pulse = app.tile_pulse(&node.target);
+                    let bg = tile_color(node.color, selected, pulse);
+                    let fg = readable_fg(bg);
+                    let primary = if node.is_folder {
+                        Style::new().fg(fg).bold()
+                    } else {
+                        Style::new().fg(fg)
+                    };
                     write_row_abs(
                         slice,
-                        &node.subtitle1,
-                        Style::new().fg(fg),
+                        &truncate(&node.name, abs_w as usize),
+                        primary,
                         abs_x,
-                        abs_y + 1,
+                        abs_y,
                         abs_w,
                     );
-                }
-                if max_rows >= 3 && !node.subtitle2.is_empty() {
-                    write_row_abs(
-                        slice,
-                        &truncate(&node.subtitle2, abs_w as usize),
-                        Style::new().fg(fg).dim(),
-                        abs_x,
-                        abs_y + 2,
-                        abs_w,
-                    );
+                    if max_rows >= 2 && (node.subtitle1.chars().count() as i32) <= abs_w {
+                        write_row_abs(
+                            slice,
+                            &node.subtitle1,
+                            Style::new().fg(fg),
+                            abs_x,
+                            abs_y + 1,
+                            abs_w,
+                        );
+                    }
+                    if max_rows >= 3 && !node.subtitle2.is_empty() {
+                        write_row_abs(
+                            slice,
+                            &truncate(&node.subtitle2, abs_w as usize),
+                            Style::new().fg(fg).dim(),
+                            abs_x,
+                            abs_y + 2,
+                            abs_w,
+                        );
+                    }
                 }
             }
 
             if !cache_hit {
+                let _p = smelt_perf::perf::begin("ui.nested.hit_regions");
                 app.last_tiles.clear();
                 for node in nodes.iter() {
                     let r = node.rect;
@@ -862,7 +885,7 @@ fn layout_tiles_into(
     app: &mut App,
     tiles: &mut Vec<treemap::Tile<usize>>,
 ) {
-    let _g = crate::perf::begin("ui.halfblock.layout");
+    let _g = smelt_perf::perf::begin("ui.halfblock.layout");
     tiles.clear();
     let cols = inner.width;
     let sub_rows = inner.height.saturating_mul(2);
@@ -1005,7 +1028,7 @@ fn composite_halfblocks(
     grid: &[Option<Color>],
     cols: usize,
 ) {
-    let _g = crate::perf::begin("ui.halfblock.fill");
+    let _g = smelt_perf::perf::begin("ui.halfblock.fill");
     let slice_origin = slice.screen_rect();
     let local_x0 = inner.left.saturating_sub(slice_origin.left);
     let local_y0 = inner.top.saturating_sub(slice_origin.top);
@@ -1052,7 +1075,7 @@ fn overlay_labels(
     app: &App,
     scaled_painted: &[bool],
 ) {
-    let _g = crate::perf::begin("ui.halfblock.text");
+    let _g = smelt_perf::perf::begin("ui.halfblock.text");
     let t0 = std::time::Instant::now();
     for (i, (r, idx)) in visible.iter().enumerate() {
         if scaled_painted.get(i).copied().unwrap_or(false) {
@@ -1203,7 +1226,7 @@ fn put_str_clip(slice: &mut GridSlice<'_>, x: u16, y: u16, text: &str, style: St
 // ── item building (tree / files view) ───────────────────────────────────────
 
 fn build_items_into(app: &App, out: &mut Vec<TileItem>) {
-    let _g = crate::perf::begin("ui.build_items");
+    let _g = smelt_perf::perf::begin("ui.build_items");
     let folder = app.current_folder();
     let total = folder.total_lines.max(1);
     match app.view {
@@ -1296,7 +1319,7 @@ fn build_files_items(app: &App, folder: &FolderNode, total: u64, out: &mut Vec<T
 // ── legend ──────────────────────────────────────────────────────────────────
 
 fn render_legend(slice: &mut GridSlice<'_>, app: &mut App) {
-    let _g = crate::perf::begin("ui.legend");
+    let _g = smelt_perf::perf::begin("ui.legend");
 
     if slice.width() == 0 || slice.height() == 0 {
         return;

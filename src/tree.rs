@@ -60,7 +60,7 @@ pub fn upsert(
     lines: u64,
     bytes: u64,
 ) -> Option<UpsertOutcome> {
-    let _g = crate::perf::begin("tree.upsert");
+    let _g = smelt_perf::perf::begin("tree.upsert");
     let segments = relative_segments(&file, root_path)?;
     Some(upsert_rec(root, &segments, 0, file, lang, lines, bytes))
 }
@@ -178,7 +178,7 @@ pub struct Removed {
 /// contribution from every ancestor's totals. Empty folders along the
 /// path are pruned. Returns `None` if no file existed there.
 pub fn remove(root: &mut FolderNode, root_path: &Path, file: &Path) -> Option<Removed> {
-    let _g = crate::perf::begin("tree.remove");
+    let _g = smelt_perf::perf::begin("tree.remove");
     let segments = relative_segments(file, root_path)?;
     remove_rec(root, &segments, 0)
 }

@@ -189,7 +189,7 @@ fn process(
     meta: &MetaCache,
     out: &Sender<WatchEvent>,
 ) {
-    let _g = crate::perf::begin("watch.process");
+    let _g = smelt_perf::perf::begin("watch.process");
 
     if matches!(kind, EventKind::Remove(_)) {
         let _ = out.send(WatchEvent::Remove {

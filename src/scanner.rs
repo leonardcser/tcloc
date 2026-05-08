@@ -204,7 +204,7 @@ fn process_file(
     cfg: &ScanConfig,
     tx: &Sender<ScanEvent>,
 ) -> Result<(), std::sync::mpsc::SendError<ScanEvent>> {
-    let _g = crate::perf::begin("scan.process_file");
+    let _g = smelt_perf::perf::begin("scan.process_file");
     let Some(lang) = classify(path, cfg) else {
         return Ok(());
     };
@@ -232,7 +232,7 @@ thread_local! {
 /// Open + line-count a single file. Public so the watcher can re-use
 /// the exact same logic for incremental updates.
 pub fn count(path: &Path, max_size: u64) -> Option<(u64, u64, Option<SystemTime>)> {
-    let _g = crate::perf::begin("scan.count");
+    let _g = smelt_perf::perf::begin("scan.count");
     let file = std::fs::File::open(path).ok()?;
     let meta = file.metadata().ok()?;
     let len = meta.len();
@@ -294,7 +294,7 @@ pub fn classify(path: &Path, cfg: &ScanConfig) -> Option<Lang> {
 }
 
 fn count_bytes(buf: &[u8]) -> Option<u64> {
-    let _g = crate::perf::begin("scan.count_bytes");
+    let _g = smelt_perf::perf::begin("scan.count_bytes");
     let head = &buf[..buf.len().min(8192)];
     if memchr::memchr(0, head).is_some() {
         return None;

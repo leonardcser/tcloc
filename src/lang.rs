@@ -366,7 +366,7 @@ fn tables() -> &'static Tables {
 }
 
 pub fn detect(path: &Path) -> Option<Lang> {
-    let _g = crate::perf::begin("lang.detect");
+    let _g = smelt_perf::perf::begin("lang.detect");
     let t = tables();
     if let Some(name) = path.file_name().and_then(|s| s.to_str())
         && let Some(def) = t.by_name.get(name)

@@ -655,14 +655,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "smelt-perf"
+version = "0.4.7"
+source = "git+file:///Users/leo/dev/rust/smelt?rev=3c8143a0#3c8143a08e6f66b2838225b6f8703d34a3738404"
+
+[[package]]
 name = "smelt-style"
 version = "0.4.7"
-source = "git+https://github.com/leonardcser/smelt?rev=bff874ca#bff874ca6103f9e944de21ae377ae6599edd34a3"
+source = "git+file:///Users/leo/dev/rust/smelt?rev=3c8143a0#3c8143a08e6f66b2838225b6f8703d34a3738404"
 
 [[package]]
 name = "smelt-term"
 version = "0.4.7"
-source = "git+https://github.com/leonardcser/smelt?rev=bff874ca#bff874ca6103f9e944de21ae377ae6599edd34a3"
+source = "git+file:///Users/leo/dev/rust/smelt?rev=3c8143a0#3c8143a08e6f66b2838225b6f8703d34a3738404"
 dependencies = [
  "crossterm",
  "smelt-style",
@@ -699,6 +704,7 @@ dependencies = [
  "memmap2",
  "notify",
  "notify-debouncer-full",
+ "smelt-perf",
  "smelt-term",
 ]
 

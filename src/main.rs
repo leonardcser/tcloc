@@ -1,11 +1,9 @@
-mod alloc_track;
 mod app;
 mod bench_report;
 mod bitmap_font;
 mod cli;
 mod format;
 mod lang;
-mod perf;
 mod scanner;
 mod tree;
 mod treemap;
@@ -27,14 +25,14 @@ use crossterm::terminal::{
 };
 use smelt_term::{Rect, Surface};
 
-use crate::alloc_track::CountingAllocator;
 use crate::app::{App, NavDir, TileTarget};
 use crate::cli::Cli;
 use crate::scanner::ScanEvent;
 use crate::watcher::{CachedMeta, MetaCache, WatchEvent};
+use smelt_perf::alloc::Counting;
 
 #[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
+static GLOBAL: Counting = Counting;
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
@@ -54,7 +52,8 @@ fn main() -> io::Result<()> {
         std::sync::Arc::new(std::sync::Mutex::new(hashbrown::HashMap::new()));
 
     if bench_enabled {
-        perf::enable();
+        smelt_perf::perf::enable();
+        smelt_perf::alloc::enable();
     }
 
     let mut app = App::new(root);
@@ -62,7 +61,7 @@ fn main() -> io::Result<()> {
     app.watching = watch_enabled;
 
     let scan_started = Instant::now();
-    let alloc_baseline = alloc_track::snapshot();
+    let alloc_baseline = smelt_perf::alloc::snapshot();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -97,7 +96,7 @@ fn main() -> io::Result<()> {
 
     let final_app = res?;
     if bench_enabled {
-        let alloc_delta = alloc_track::delta(alloc_baseline, alloc_track::snapshot());
+        let alloc_delta = smelt_perf::alloc::delta(alloc_baseline, smelt_perf::alloc::snapshot());
         bench_report::print(
             &final_app,
             scan_started,
@@ -105,7 +104,7 @@ fn main() -> io::Result<()> {
             bench_vcs.as_deref(),
             alloc_delta,
         );
-        perf::print_summary();
+        smelt_perf::perf::print_summary();
     }
     Ok(())
 }
@@ -342,16 +341,16 @@ fn draw_frame(
 ) -> io::Result<()> {
     let frame_t0 = Instant::now();
     let alloc_pre = if app.bench.enabled {
-        Some(alloc_track::snapshot())
+        Some(smelt_perf::alloc::snapshot())
     } else {
         None
     };
-    let _g = perf::begin("loop.terminal_draw");
+    let _g = smelt_perf::perf::begin("loop.terminal_draw");
     crate::ui::render(ui, app, writer)?;
     drop(_g);
     let frame_d = frame_t0.elapsed();
     if let Some(pre) = alloc_pre {
-        let post = alloc_track::snapshot();
+        let post = smelt_perf::alloc::snapshot();
         let bytes_delta = post.bytes_allocated.saturating_sub(pre.bytes_allocated);
         let alloc_delta = post.allocs.saturating_sub(pre.allocs);
         app.bench.last_full_render = frame_d;
@@ -361,7 +360,7 @@ fn draw_frame(
         let lat = t.elapsed();
         app.bench.last_input_latency = Some(lat);
         if app.bench.enabled {
-            perf::record_value("ui.input_to_draw", lat.as_micros() as u64);
+            smelt_perf::perf::record_value("ui.input_to_draw", lat.as_micros() as u64);
         }
     }
     Ok(())
