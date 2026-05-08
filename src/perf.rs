@@ -50,14 +50,14 @@ pub fn begin(label: &'static str) -> Option<Guard> {
     Some(Guard {
         label,
         start: Instant::now(),
-        allocs_start: alloc_track::snapshot(),
+        allocs_start: alloc_track::thread_snapshot(),
     })
 }
 
 pub struct Guard {
     label: &'static str,
     start: Instant,
-    allocs_start: alloc_track::AllocStats,
+    allocs_start: (u64, u64),
 }
 
 impl Drop for Guard {
@@ -66,11 +66,10 @@ impl Drop for Guard {
         if let Ok(mut s) = samples().lock() {
             s.entry(self.label).or_default().push(dur);
         }
-        let end = alloc_track::snapshot();
-        let dc = end.allocs.saturating_sub(self.allocs_start.allocs);
-        let db = end
-            .bytes_allocated
-            .saturating_sub(self.allocs_start.bytes_allocated);
+        let (a1, b1) = alloc_track::thread_snapshot();
+        let (a0, b0) = self.allocs_start;
+        let dc = a1.saturating_sub(a0);
+        let db = b1.saturating_sub(b0);
         if let Ok(mut m) = alloc_samples().lock() {
             m.entry(self.label).or_default().push((dc, db));
         }

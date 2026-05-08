@@ -1,4 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -8,6 +9,11 @@ static BYTES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 static BYTES_DEALLOCATED: AtomicU64 = AtomicU64::new(0);
 static CURRENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static T_ALLOCS: Cell<u64> = const { Cell::new(0) };
+    static T_BYTES: Cell<u64> = const { Cell::new(0) };
+}
 
 pub struct CountingAllocator;
 
@@ -19,6 +25,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
             BYTES_ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
             let cur = CURRENT_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             update_peak(cur);
+            // Per-thread tally for perf::Guard attribution. `try_with`
+            // is required because the allocator can run during TLS
+            // teardown (drop order), which would otherwise panic.
+            let _ = T_ALLOCS.try_with(|c| c.set(c.get() + 1));
+            let _ = T_BYTES.try_with(|c| c.set(c.get() + layout.size() as u64));
         }
         p
     }
@@ -40,6 +51,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
                 let cur =
                     CURRENT_BYTES.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
                 update_peak(cur);
+                let _ = T_BYTES.try_with(|c| c.set(c.get() + (new_size - old) as u64));
             } else {
                 BYTES_DEALLOCATED.fetch_add((old - new_size) as u64, Ordering::Relaxed);
                 CURRENT_BYTES.fetch_sub(old - new_size, Ordering::Relaxed);
@@ -47,6 +59,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
         }
         p
     }
+}
+
+/// Calling-thread allocation totals. Used by `perf::Guard` to attribute
+/// allocs to the thread doing the work, free of cross-thread noise.
+pub fn thread_snapshot() -> (u64, u64) {
+    let allocs = T_ALLOCS.try_with(|c| c.get()).unwrap_or(0);
+    let bytes = T_BYTES.try_with(|c| c.get()).unwrap_or(0);
+    (allocs, bytes)
 }
 
 fn update_peak(cur: usize) {
