@@ -455,26 +455,31 @@ fn render_nested(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
     );
 
     let bitmap_on = bitmap_enabled(inner);
+    let max_scale = max_label_scale(inner);
+    let cache_key = (app.data_version, root_rect);
     NESTED_BUF.with(|n| {
         let mut nodes = n.borrow_mut();
-        nodes.clear();
         let layout_t0 = std::time::Instant::now();
-        {
-            let folder = app.current_folder();
-            let base_path = app.current_path.clone();
+        let cache_hit = app.last_nested_key == Some(cache_key) && !nodes.is_empty();
+        if !cache_hit {
+            let _g = crate::perf::begin("ui.nested.build");
+            nodes.clear();
             build_nested(
-                folder,
+                app.current_folder(),
                 root_rect,
-                &base_path,
+                &app.current_path,
                 bitmap_on,
-                max_label_scale(inner),
+                max_scale,
                 &mut nodes,
             );
+            app.last_nested_key = Some(cache_key);
         }
         if nodes.is_empty() {
             return;
         }
-        record_layout_bench(app, layout_t0.elapsed(), 1, 0, nodes.len() as u32);
+        if !cache_hit {
+            record_layout_bench(app, layout_t0.elapsed(), 1, 0, nodes.len() as u32);
+        }
 
         SCALED_PAINTED_BUF.with(|sp| {
             let mut scaled_painted = sp.borrow_mut();
@@ -692,6 +697,26 @@ fn build_nested_at(
         rect.height - top_band - bottom_pad,
     );
 
+    // Drop children too small to produce a visible tile before they
+    // reach squarify — keeps every per-level buffer O(K visible) instead
+    // of O(N total). Mirrors `layout_tiles`'s `pre_min` for the flat path.
+    let area_subcells = (inner.width as u64) * (inner.height as u64);
+    if area_subcells == 0 {
+        return;
+    }
+    let total_value: u64 = folder
+        .children
+        .values()
+        .map(|c| match c {
+            Node::File(f) => f.lines,
+            Node::Folder(s) => s.total_lines,
+        })
+        .sum();
+    if total_value == 0 {
+        return;
+    }
+    let cell_value = total_value as f64 / area_subcells as f64;
+    let pre_min = (cell_value * (MIN_TILE_SUBCELLS as f64).powi(2)).max(1.0);
     let mut entries: Vec<(&str, &Node, u64)> = folder
         .children
         .iter()
@@ -700,7 +725,7 @@ fn build_nested_at(
                 Node::File(f) => f.lines,
                 Node::Folder(s) => s.total_lines,
             };
-            if v == 0 {
+            if (v as f64) < pre_min {
                 None
             } else {
                 Some((name.as_str(), child, v))

@@ -118,6 +118,13 @@ pub struct App {
     pub ranked_cache: Vec<(Lang, LangStats)>,
     pub stats_dirty: bool,
     pub items_dirty: bool,
+    /// Bumped on any change that affects tile geometry (tree mutation,
+    /// zoom, view, resize). Paired with the rect as the nested-layout
+    /// cache key.
+    pub data_version: u64,
+    /// `(data_version, root_rect)` the nested `NESTED_BUF` was last
+    /// built with. Match → reuse; mismatch → rebuild.
+    pub last_nested_key: Option<(u64, Rect)>,
     pub selected: Option<TileTarget>,
     pub legend_rect: Rect,
     pub legend_scroll: usize,
@@ -152,6 +159,8 @@ impl App {
             ranked_cache: Vec::new(),
             stats_dirty: true,
             items_dirty: true,
+            data_version: 0,
+            last_nested_key: None,
             selected: None,
             legend_rect: Rect::default(),
             legend_scroll: 0,
@@ -166,6 +175,13 @@ impl App {
             watching: false,
             pulses: HashMap::new(),
         }
+    }
+
+    /// Bump both dirty signals: `items_dirty` for the flat path,
+    /// `data_version` for the nested layout cache.
+    pub fn mark_layout_dirty(&mut self) {
+        self.items_dirty = true;
+        self.data_version = self.data_version.wrapping_add(1);
     }
 
     pub fn record(&mut self, path: PathBuf, lang: Lang, lines: u64, bytes: u64, count_nanos: u64) {
@@ -226,7 +242,7 @@ impl App {
         }
         self.last_path = Some(path.clone());
         self.stats_dirty = true;
-        self.items_dirty = true;
+        self.mark_layout_dirty();
         if pulse {
             self.pulses.insert(path, Instant::now());
         }
@@ -252,7 +268,7 @@ impl App {
         self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
         self.pulses.remove(path);
         self.stats_dirty = true;
-        self.items_dirty = true;
+        self.mark_layout_dirty();
     }
 
     /// Brightness boost in `0.0..=PULSE_PEAK` for `path`, computed with
@@ -327,7 +343,7 @@ impl App {
     pub fn up(&mut self) -> bool {
         if self.current_path.pop().is_some() {
             self.selected = None;
-            self.items_dirty = true;
+            self.mark_layout_dirty();
             true
         } else {
             false
@@ -338,7 +354,7 @@ impl App {
         if let Some(TileTarget::Folder(path)) = self.selected.clone() {
             self.current_path = path;
             self.selected = self.first_visible_target();
-            self.items_dirty = true;
+            self.mark_layout_dirty();
         }
     }
 
@@ -384,7 +400,7 @@ impl App {
             View::Nested => View::Tree,
         };
         self.selected = None;
-        self.items_dirty = true;
+        self.mark_layout_dirty();
     }
 
     pub fn navigate(&mut self, dir: NavDir) {

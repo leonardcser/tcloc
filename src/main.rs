@@ -380,9 +380,10 @@ fn handle_event(ev: Event, ui: &mut Surface, app: &mut App) -> EventOutcome {
         Event::Mouse(me) => handle_mouse(me, app),
         Event::Resize(w, h) => {
             ui.set_terminal_size(w, h);
-            // Tile rects are sized in cells, so a resize invalidates the
-            // cached layout. Items themselves don't change.
+            // Resize invalidates tile rects → drop hit regions and
+            // force the nested layout cache to rebuild.
             app.last_tiles.clear();
+            app.mark_layout_dirty();
             EventOutcome::Redraw
         }
         _ => EventOutcome::Ignored,
@@ -427,7 +428,7 @@ fn handle_mouse(me: event::MouseEvent, app: &mut App) -> EventOutcome {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(TileTarget::Folder(path)) = app.hit(me.column, me.row).cloned() {
                 app.current_path = path;
-                app.items_dirty = true;
+                app.mark_layout_dirty();
                 return EventOutcome::Redraw;
             }
         }
