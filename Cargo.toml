@@ -13,4 +13,4 @@ memchr = "2.8.0"
 memmap2 = "0.9.10"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
-smelt_term = { package = "smelt-term", git = "https://github.com/leonardcser/smelt", rev = "e9006242" }
+smelt_term = { package = "smelt-term", git = "https://github.com/leonardcser/smelt", rev = "8984dfc2" }
