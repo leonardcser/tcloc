@@ -85,6 +85,7 @@ thread_local! {
     static LAYOUT_SORTED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static LAYOUT_EXCLUDED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
     static LAYOUT_TM_ITEMS: RefCell<Vec<Item<usize>>> = const { RefCell::new(Vec::new()) };
+    static FLAT_TILES_BUF: RefCell<Vec<treemap::Tile<usize>>> = const { RefCell::new(Vec::new()) };
     static VISIBLE_BUF: RefCell<Vec<(Rect, usize)>> = const { RefCell::new(Vec::new()) };
     static NESTED_BUF: RefCell<Vec<NestedNode>> = const { RefCell::new(Vec::new()) };
     static SCALED_PAINTED_BUF: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
@@ -352,9 +353,9 @@ fn render_bench_hud(slice: &mut GridSlice<'_>, app: &App) {
 
 fn render_treemap(slice: &mut GridSlice<'_>, app: &mut App) {
     let _g = crate::perf::begin("ui.treemap");
-    app.last_tiles.clear();
 
     if slice.width() == 0 || slice.height() == 0 {
+        app.last_tiles.clear();
         return;
     }
     let inner = slice.screen_rect();
@@ -379,63 +380,77 @@ fn render_flat(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
             app.items_dirty = false;
         }
         if buf.is_empty() {
+            app.last_flat_key = None;
+            app.last_tiles.clear();
             return;
         }
 
-        let tiles = layout_tiles(&buf, inner, app);
-        if tiles.is_empty() {
-            return;
-        }
+        let cache_key = (app.items_version, inner);
+        let cache_hit = app.last_flat_key == Some(cache_key);
 
-        let cols = inner.width as usize;
-        let sub_rows = (inner.height as usize) * 2;
-        GRID_BUF.with(|g| {
-            let mut grid = g.borrow_mut();
-            grid.clear();
-            grid.resize(cols * sub_rows, None);
+        FLAT_TILES_BUF.with(|tb| {
+            let mut tiles = tb.borrow_mut();
             VISIBLE_BUF.with(|v| {
                 let mut visible = v.borrow_mut();
-                visible.clear();
-                rasterize_tiles(&buf, &tiles, &mut grid, cols, sub_rows, app, &mut visible);
+                if !cache_hit {
+                    layout_tiles_into(&buf, inner, app, &mut tiles);
+                    visible.clear();
+                    compute_visible_into(&tiles, &mut visible);
+                    app.last_tiles.clear();
+                    record_hit_regions(&tiles, &buf, inner, &mut app.last_tiles);
+                    app.last_flat_key = Some(cache_key);
+                }
+                if visible.is_empty() {
+                    return;
+                }
 
-                SCALED_PAINTED_BUF.with(|sp| {
-                    let mut scaled_painted = sp.borrow_mut();
-                    scaled_painted.clear();
-                    scaled_painted.resize(visible.len(), false);
+                let cols = inner.width as usize;
+                let sub_rows = (inner.height as usize) * 2;
+                GRID_BUF.with(|g| {
+                    let mut grid = g.borrow_mut();
+                    grid.clear();
+                    grid.resize(cols * sub_rows, None);
+                    paint_visible_into_grid(&visible, &buf, &mut grid, cols, sub_rows, app);
 
-                    let _g = crate::perf::begin("ui.bitmap_labels");
-                    if bitmap_enabled(inner) {
-                        let max_scale = max_label_scale(inner);
-                        for (i, (r, idx)) in visible.iter().enumerate() {
-                            let item = &buf[*idx];
-                            let Some(scale) =
-                                pick_label_scale(&item.name, r.width, r.height, max_scale)
-                            else {
-                                continue;
-                            };
-                            let selected = app.selected.as_ref() == Some(&item.target);
-                            let pulse = app.tile_pulse(&item.target);
-                            let bg = tile_color(item.color, selected, pulse);
-                            let fg = readable_fg(bg);
-                            let label_w = bitmap_font::label_width(&item.name, scale);
-                            let label_h = bitmap_font::label_height(scale);
-                            let x0 = r.left as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
-                            let y0 = r.top as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32;
-                            bitmap_font::paint(
-                                &mut grid, cols, sub_rows, x0, y0, &item.name, fg, scale,
-                            );
-                            scaled_painted[i] = true;
+                    SCALED_PAINTED_BUF.with(|sp| {
+                        let mut scaled_painted = sp.borrow_mut();
+                        scaled_painted.clear();
+                        scaled_painted.resize(visible.len(), false);
+
+                        let _g = crate::perf::begin("ui.bitmap_labels");
+                        if bitmap_enabled(inner) {
+                            let max_scale = max_label_scale(inner);
+                            for (i, (r, idx)) in visible.iter().enumerate() {
+                                let item = &buf[*idx];
+                                let Some(scale) =
+                                    pick_label_scale(&item.name, r.width, r.height, max_scale)
+                                else {
+                                    continue;
+                                };
+                                let selected = app.selected.as_ref() == Some(&item.target);
+                                let pulse = app.tile_pulse(&item.target);
+                                let bg = tile_color(item.color, selected, pulse);
+                                let fg = readable_fg(bg);
+                                let label_w = bitmap_font::label_width(&item.name, scale);
+                                let label_h = bitmap_font::label_height(scale);
+                                let x0 =
+                                    r.left as i32 + ((r.width.saturating_sub(label_w)) / 2) as i32;
+                                let y0 =
+                                    r.top as i32 + ((r.height.saturating_sub(label_h)) / 2) as i32;
+                                bitmap_font::paint(
+                                    &mut grid, cols, sub_rows, x0, y0, &item.name, fg, scale,
+                                );
+                                scaled_painted[i] = true;
+                            }
                         }
-                    }
-                    drop(_g);
+                        drop(_g);
 
-                    composite_halfblocks(slice, inner, &grid, cols);
-                    overlay_labels(slice, inner, &visible, &buf, app, &scaled_painted);
+                        composite_halfblocks(slice, inner, &grid, cols);
+                        overlay_labels(slice, inner, &visible, &buf, app, &scaled_painted);
+                    });
                 });
             });
         });
-
-        record_hit_regions(&tiles, &buf, inner, &mut app.last_tiles);
     });
 }
 
@@ -601,20 +616,23 @@ fn render_nested(slice: &mut GridSlice<'_>, inner: Rect, app: &mut App) {
                 }
             }
 
-            for node in nodes.iter() {
-                let r = node.rect;
-                let cy0 = r.top as i32 / 2;
-                let cy1 = (r.top as i32 + r.height as i32 + 1) / 2;
-                let cell_rect = Rect::new(
-                    (inner.top as i32 + cy0).max(0) as u16,
-                    (inner.left as i32 + r.left as i32).max(0) as u16,
-                    r.width,
-                    (cy1 - cy0).max(0) as u16,
-                );
-                if cell_rect.width == 0 || cell_rect.height == 0 {
-                    continue;
+            if !cache_hit {
+                app.last_tiles.clear();
+                for node in nodes.iter() {
+                    let r = node.rect;
+                    let cy0 = r.top as i32 / 2;
+                    let cy1 = (r.top as i32 + r.height as i32 + 1) / 2;
+                    let cell_rect = Rect::new(
+                        (inner.top as i32 + cy0).max(0) as u16,
+                        (inner.left as i32 + r.left as i32).max(0) as u16,
+                        r.width,
+                        (cy1 - cy0).max(0) as u16,
+                    );
+                    if cell_rect.width == 0 || cell_rect.height == 0 {
+                        continue;
+                    }
+                    app.last_tiles.push((cell_rect, node.target.clone()));
                 }
-                app.last_tiles.push((cell_rect, node.target.clone()));
             }
         });
     });
@@ -752,7 +770,7 @@ fn build_nested_at(
         if active.is_empty() {
             break;
         }
-        tiles = treemap::squarify(&active, inner);
+        treemap::squarify_into(&active, inner, &mut tiles);
         let before = excluded_count;
         for t in &tiles {
             if (t.rect.width < MIN_TILE_SUBCELLS
@@ -838,26 +856,30 @@ fn build_nested_at(
     }
 }
 
-fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::Tile<usize>> {
+fn layout_tiles_into(
+    items: &[TileItem],
+    inner: Rect,
+    app: &mut App,
+    tiles: &mut Vec<treemap::Tile<usize>>,
+) {
     let _g = crate::perf::begin("ui.halfblock.layout");
+    tiles.clear();
     let cols = inner.width;
     let sub_rows = inner.height.saturating_mul(2);
     let area_subcells = (cols as u64) * (sub_rows as u64);
     let total_value: u64 = items.iter().map(|i| i.value).sum();
     if total_value == 0 || area_subcells == 0 {
         record_layout_bench(app, std::time::Duration::ZERO, 0, 0, 0);
-        return Vec::new();
+        return;
     }
 
-    // Inflate the layout area by one gutter on the right and bottom so
-    // the edge tiles, after their per-tile gap shrink in rasterize_tiles,
-    // snap back exactly to the panel boundary instead of leaving a dead
-    // column / half-row of empty space.
+    // Inflate by one gutter on right/bottom so the per-tile gap shrink
+    // in rasterize_tiles snaps edge tiles back to the panel boundary.
     let layout_area = Rect::new(0, 0, cols + GAP_SUBCELLS, sub_rows + GAP_SUBCELLS);
     let cell_value = total_value as f64 / area_subcells as f64;
     let pre_min = (cell_value * (MIN_TILE_SUBCELLS as f64).powi(2)).max(1.0);
 
-    let (tiles, iters, excluded_count, t0) = LAYOUT_SORTED.with(|s| {
+    let (iters, excluded_count, t0) = LAYOUT_SORTED.with(|s| {
         LAYOUT_EXCLUDED.with(|e| {
             LAYOUT_TM_ITEMS.with(|tm| {
                 let mut sorted = s.borrow_mut();
@@ -874,11 +896,10 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
                 excluded.resize(items.len(), false);
 
                 let t0 = std::time::Instant::now();
-                let mut tiles: Vec<treemap::Tile<usize>> = Vec::new();
                 let mut iters: u32 = 0;
                 let mut excluded_count: usize = 0;
                 if sorted.is_empty() {
-                    return (tiles, iters, excluded_count, t0);
+                    return (iters, excluded_count, t0);
                 }
                 for _ in 0..MAX_LAYOUT_PASSES {
                     iters += 1;
@@ -892,9 +913,9 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
                     if tm_items.is_empty() {
                         break;
                     }
-                    tiles = treemap::squarify(&tm_items, layout_area);
+                    treemap::squarify_into(&tm_items, layout_area, tiles);
                     let before = excluded_count;
-                    for t in &tiles {
+                    for t in tiles.iter() {
                         if (t.rect.width < MIN_TILE_SUBCELLS || t.rect.height < MIN_TILE_SUBCELLS)
                             && !excluded[t.data]
                         {
@@ -909,7 +930,7 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
                 tiles.retain(|t| {
                     t.rect.width >= MIN_TILE_SUBCELLS && t.rect.height >= MIN_TILE_SUBCELLS
                 });
-                (tiles, iters, excluded_count, t0)
+                (iters, excluded_count, t0)
             })
         })
     });
@@ -920,7 +941,6 @@ fn layout_tiles(items: &[TileItem], inner: Rect, app: &mut App) -> Vec<treemap::
         excluded_count as u32,
         tiles.len() as u32,
     );
-    tiles
 }
 
 fn record_layout_bench(
@@ -939,15 +959,7 @@ fn record_layout_bench(
     app.bench.last_tiles_drawn = drawn;
 }
 
-fn rasterize_tiles(
-    items: &[TileItem],
-    tiles: &[treemap::Tile<usize>],
-    grid: &mut [Option<Color>],
-    cols: usize,
-    sub_rows: usize,
-    app: &App,
-    visible: &mut Vec<(Rect, usize)>,
-) {
+fn compute_visible_into(tiles: &[treemap::Tile<usize>], visible: &mut Vec<(Rect, usize)>) {
     visible.reserve(tiles.len());
     for tile in tiles {
         let mut r = tile.rect;
@@ -956,8 +968,20 @@ fn rasterize_tiles(
         }
         r.width -= GAP_SUBCELLS;
         r.height -= GAP_SUBCELLS;
+        visible.push((r, tile.data));
+    }
+}
 
-        let item = &items[tile.data];
+fn paint_visible_into_grid(
+    visible: &[(Rect, usize)],
+    items: &[TileItem],
+    grid: &mut [Option<Color>],
+    cols: usize,
+    sub_rows: usize,
+    app: &App,
+) {
+    for (r, idx) in visible {
+        let item = &items[*idx];
         let selected = app.selected.as_ref() == Some(&item.target);
         let pulse = app.tile_pulse(&item.target);
         let color = tile_color(item.color, selected, pulse);
@@ -969,7 +993,6 @@ fn rasterize_tiles(
                 grid[sy as usize * cols + sx as usize] = Some(color);
             }
         }
-        visible.push((r, tile.data));
     }
 }
 

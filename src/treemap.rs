@@ -12,14 +12,15 @@ pub struct Tile<T> {
     pub data: T,
 }
 
-pub fn squarify<T: Clone>(items: &[Item<T>], area: Rect) -> Vec<Tile<T>> {
+pub fn squarify_into<T: Clone>(items: &[Item<T>], area: Rect, out: &mut Vec<Tile<T>>) {
+    out.clear();
     if items.is_empty() || area.width == 0 || area.height == 0 {
-        return Vec::new();
+        return;
     }
 
     let total_value: f64 = items.iter().map(|i| i.value).sum();
     if total_value <= 0.0 {
-        return Vec::new();
+        return;
     }
     let total_area = (area.width as f64) * (area.height as f64);
     let scale = total_area / total_value;
@@ -30,15 +31,14 @@ pub fn squarify<T: Clone>(items: &[Item<T>], area: Rect) -> Vec<Tile<T>> {
         .collect();
     sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut out = Vec::with_capacity(items.len());
+    out.reserve(items.len());
     let bounds = FRect {
         x: area.left as f64,
         y: area.top as f64,
         w: area.width as f64,
         h: area.height as f64,
     };
-    layout(&sorted, bounds, &mut out);
-    out
+    layout(&sorted, bounds, out);
 }
 
 #[derive(Clone, Copy)]

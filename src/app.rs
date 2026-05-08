@@ -118,12 +118,12 @@ pub struct App {
     pub ranked_cache: Vec<(Lang, LangStats)>,
     pub stats_dirty: bool,
     pub items_dirty: bool,
-    /// Bumped on any change that affects tile geometry (tree mutation,
-    /// zoom, view, resize). Paired with the rect as the nested-layout
-    /// cache key.
+    /// Flat-layout cache key, bumped on every items mutation.
+    pub items_version: u64,
+    /// Nested-layout cache key, bumped only on structural changes —
+    /// not per scanner event.
     pub data_version: u64,
-    /// `(data_version, root_rect)` the nested `NESTED_BUF` was last
-    /// built with. Match → reuse; mismatch → rebuild.
+    pub last_flat_key: Option<(u64, Rect)>,
     pub last_nested_key: Option<(u64, Rect)>,
     pub selected: Option<TileTarget>,
     pub legend_rect: Rect,
@@ -159,7 +159,9 @@ impl App {
             ranked_cache: Vec::new(),
             stats_dirty: true,
             items_dirty: true,
+            items_version: 0,
             data_version: 0,
+            last_flat_key: None,
             last_nested_key: None,
             selected: None,
             legend_rect: Rect::default(),
@@ -177,10 +179,13 @@ impl App {
         }
     }
 
-    /// Bump both dirty signals: `items_dirty` for the flat path,
-    /// `data_version` for the nested layout cache.
-    pub fn mark_layout_dirty(&mut self) {
+    pub fn mark_items_dirty(&mut self) {
         self.items_dirty = true;
+        self.items_version = self.items_version.wrapping_add(1);
+    }
+
+    pub fn mark_layout_dirty(&mut self) {
+        self.mark_items_dirty();
         self.data_version = self.data_version.wrapping_add(1);
     }
 
@@ -242,9 +247,11 @@ impl App {
         }
         self.last_path = Some(path.clone());
         self.stats_dirty = true;
-        self.mark_layout_dirty();
         if pulse {
+            self.mark_layout_dirty();
             self.pulses.insert(path, Instant::now());
+        } else {
+            self.mark_items_dirty();
         }
     }
 
@@ -516,6 +523,7 @@ impl App {
         if !self.done {
             self.done = true;
             self.finished_at = Some(at);
+            self.mark_layout_dirty();
         }
     }
 
