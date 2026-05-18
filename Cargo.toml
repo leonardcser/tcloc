@@ -13,5 +13,5 @@ memchr = "2.8.0"
 memmap2 = "0.9.10"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
-smelt-term = { git = "file:///Users/leo/dev/rust/smelt", rev = "3c8143a0" }
-smelt-perf = { git = "file:///Users/leo/dev/rust/smelt", rev = "3c8143a0" }
+smelt-term = { git = "file:///Users/leo/dev/rust/smelt", rev = "cdab7806" }
+smelt-perf = { git = "file:///Users/leo/dev/rust/smelt", rev = "cdab7806" }

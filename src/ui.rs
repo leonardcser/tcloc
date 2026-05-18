@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::io::Write;
 
 use smelt_term::grid::{Color, GridSlice, Style};
-use smelt_term::layout::BorderStyle;
 use smelt_term::{Border, Constraint, LayoutTree, Line, PaintId, Rect, Span, Surface};
 
 use crate::app::{App, TileTarget, View};
@@ -144,7 +143,7 @@ pub fn render<W: Write>(ui: &mut Surface, app: &mut App, w: &mut W) -> std::io::
         let mut items = vec![
             (
                 Constraint::Length(2),
-                LayoutTree::leaf(PAINT_HEADER).with_border(Border::bottom(BorderStyle::Single)),
+                LayoutTree::leaf(PAINT_HEADER).with_border(Border::single().bottom(())),
             ),
             (
                 Constraint::Fill,
