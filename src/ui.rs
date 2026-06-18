@@ -363,7 +363,7 @@ fn render_treemap(slice: &mut GridSlice<'_>, app: &mut App) {
         app.last_tiles.clear();
         return;
     }
-    let inner = slice.screen_rect();
+    let inner = slice.grid_rect();
 
     if matches!(app.view, View::Nested) {
         render_nested(slice, inner, app);
@@ -1028,7 +1028,7 @@ fn composite_halfblocks(
     cols: usize,
 ) {
     let _g = smelt_perf::perf::begin("ui.halfblock.fill");
-    let slice_origin = slice.screen_rect();
+    let slice_origin = slice.grid_rect();
     let local_x0 = inner.left.saturating_sub(slice_origin.left);
     let local_y0 = inner.top.saturating_sub(slice_origin.top);
     for cy in 0..(inner.height as usize) {
@@ -1176,7 +1176,7 @@ fn write_label(
 /// background instead of resetting it to the terminal default. Mirrors
 /// ratatui's `cell.set_char(ch).set_fg(fg)` partial-update behaviour.
 fn write_row_abs(slice: &mut GridSlice<'_>, text: &str, style: Style, x: i32, y: i32, w: i32) {
-    let origin = slice.screen_rect();
+    let origin = slice.grid_rect();
     if y < 0 {
         return;
     }
@@ -1325,9 +1325,9 @@ fn render_legend(slice: &mut GridSlice<'_>, app: &mut App) {
     }
 
     // Slice already lives inside the layout-tree-painted border; its
-    // screen_rect is the inner area. Tracked on `App` so the host's
+    // grid_rect is the inner area. Tracked on `App` so the host's
     // mouse handler can detect wheel events inside the legend.
-    let inner = slice.screen_rect();
+    let inner = slice.grid_rect();
     app.legend_rect = inner;
 
     app.ensure_ranked();

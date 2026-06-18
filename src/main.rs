@@ -10,20 +10,15 @@ mod treemap;
 mod ui;
 mod watcher;
 
-use std::io::{self, BufWriter, Stdout, Write};
+use std::io::{self, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use smelt_term::{Rect, Surface};
+use smelt_term::{Rect, Surface, SuspendScreen, TerminalSession};
 
 use crate::app::{App, NavDir, TileTarget};
 use crate::cli::Cli;
@@ -63,21 +58,16 @@ fn main() -> io::Result<()> {
     let scan_started = Instant::now();
     let alloc_baseline = smelt_perf::alloc::snapshot();
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    // Wrap stdout in a BufWriter so smelt-ui's many small per-cell writes
-    // are coalesced into one syscall per frame instead of one per cell.
-    // 256 KiB is enough to hold a full 240×60-cell diff worth of escape
-    // sequences without flushing mid-frame; smelt-ui's flush path drops
-    // back to the underlying writer once per frame.
-    let mut writer = io::BufWriter::with_capacity(256 * 1024, stdout);
-    let (term_w, term_h) = crossterm::terminal::size()?;
+    let mut term = TerminalSession::builder()
+        .buffer_capacity(256 * 1024)
+        .hide_cursor(false)
+        .enter_stdout()?;
+    let (term_w, term_h) = term.size()?;
     let mut ui = Surface::new(term_w, term_h);
 
-    let res = run(
+    let final_app = run(
         &mut ui,
-        &mut writer,
+        &mut term,
         app,
         rx,
         watch_rx,
@@ -86,15 +76,7 @@ fn main() -> io::Result<()> {
         scan_cfg,
         watch_enabled,
         auto_exit_ms,
-    );
-
-    disable_raw_mode()?;
-    execute!(writer, DisableMouseCapture, LeaveAlternateScreen)?;
-    // Show the cursor again after leaving the alt screen.
-    execute!(writer, crossterm::cursor::Show)?;
-    writer.flush()?;
-
-    let final_app = res?;
+    )?;
     if bench_enabled {
         let alloc_delta = smelt_perf::alloc::delta(alloc_baseline, smelt_perf::alloc::snapshot());
         bench_report::print(
@@ -110,9 +92,9 @@ fn main() -> io::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(
+fn run<W: Write>(
     ui: &mut Surface,
-    writer: &mut BufWriter<Stdout>,
+    term: &mut TerminalSession<W>,
     mut app: App,
     rx: mpsc::Receiver<ScanEvent>,
     watch_rx: mpsc::Receiver<WatchEvent>,
@@ -169,7 +151,7 @@ fn run(
         let interval_elapsed = last_draw.elapsed() >= frame_interval;
         if input_dirty || (scan_dirty && interval_elapsed) {
             let t0 = Instant::now();
-            draw_frame(ui, writer, &mut app, pending_input_at.take())?;
+            draw_frame(ui, term.writer(), &mut app, pending_input_at.take())?;
             let adaptive = t0
                 .elapsed()
                 .saturating_mul(6)
@@ -212,7 +194,7 @@ fn run(
                         }
                     }
                     EventOutcome::OpenEditor(path) => {
-                        open_in_editor(ui, writer, &path)?;
+                        open_in_editor(ui, term, &path)?;
                         input_dirty = true;
                     }
                     EventOutcome::Ignored => {}
@@ -225,9 +207,9 @@ fn run(
 /// Suspend the TUI, hand the terminal to `$EDITOR` (or `vi`), then restore
 /// alternate screen + raw mode so the app can keep running. The editor
 /// inherits stdio so it works for full-screen editors like vim/nvim.
-fn open_in_editor(
+fn open_in_editor<W: Write>(
     ui: &mut Surface,
-    writer: &mut BufWriter<Stdout>,
+    term: &mut TerminalSession<W>,
     path: &std::path::Path,
 ) -> io::Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
@@ -237,17 +219,13 @@ fn open_in_editor(
     };
     let extra: Vec<&str> = parts.collect();
 
-    disable_raw_mode()?;
-    execute!(writer, DisableMouseCapture, LeaveAlternateScreen)?;
-    writer.flush()?;
+    term.suspend_with(SuspendScreen::LeaveAlternate, || {
+        let _ = std::process::Command::new(cmd)
+            .args(&extra)
+            .arg(path)
+            .status();
+    });
 
-    let _ = std::process::Command::new(cmd)
-        .args(&extra)
-        .arg(path)
-        .status();
-
-    enable_raw_mode()?;
-    execute!(writer, EnterAlternateScreen, EnableMouseCapture)?;
     // Force the next frame to repaint everything — the editor wiped the
     // alt screen, so smelt-ui's diff-against-previous would no-op the
     // unchanged cells and leave a blank screen behind.
@@ -333,9 +311,9 @@ fn drain_watch_events(rx: &mpsc::Receiver<WatchEvent>, app: &mut App, meta: &Met
     }
 }
 
-fn draw_frame(
+fn draw_frame<W: Write>(
     ui: &mut Surface,
-    writer: &mut BufWriter<Stdout>,
+    writer: &mut W,
     app: &mut App,
     input_at: Option<Instant>,
 ) -> io::Result<()> {
