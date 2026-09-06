@@ -27,33 +27,6 @@ cd tcloc
 cargo install --path . --locked
 ```
 
-## Releasing
-
-Releases are published to crates.io by `.github/workflows/publish.yml` using
-Trusted Publishing (OIDC), without a long-lived API token in GitHub.
-
-For a new crate, crates.io requires the first release to be published manually
-with an API token. After committing these changes, create a short-lived crates.io
-API token with permission to publish `tcloc`, authenticate locally with
-`cargo login`, and run `cargo publish --locked`. Revoke the token afterward.
-Do not add it to the repository or GitHub secrets.
-
-After the first publication, open the crate's **Settings > Trusted Publishing**
-on crates.io and add a GitHub publisher with:
-
-- Repository owner: `leonardcser`
-- Repository name: `tcloc`
-- Workflow filename: `publish.yml`
-- Environment: leave blank
-
-No GitHub repository secrets are required. The workflow requests a temporary
-crates.io token using GitHub's OIDC identity.
-
-For subsequent releases, update the version in `Cargo.toml`, refresh `Cargo.lock` with
-`cargo check`, and commit both files. Push a matching tag, such as `v0.1.0`.
-The workflow verifies the tag matches the package version, checks formatting,
-runs Clippy and tests, verifies the package, and publishes it to crates.io.
-
 ## Usage
 
 ```bash
@@ -116,3 +89,7 @@ tcloc --vcs git
 | `--auto-exit-ms <MS>`      | Exit N ms after the scan finishes (useful with `--bench`)        |
 
 Run `tcloc --help` for the full list.
+
+## Releasing
+
+See [RELEASE.md](https://github.com/leonardcser/tcloc/blob/main/RELEASE.md) for versioning and release instructions.
