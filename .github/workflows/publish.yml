@@ -64,11 +64,45 @@ jobs:
       - name: Verify packaging
         run: cargo publish --locked --dry-run
 
+      - name: Check whether version is already published
+        id: registry
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          with open("/tmp/cargo-metadata.json", encoding="utf-8") as file:
+              metadata = json.load(file)
+          package = next(p for p in metadata["packages"] if p["name"] == "tcloc")
+          version = package["version"]
+          request = urllib.request.Request(
+              f"https://crates.io/api/v1/crates/tcloc/{version}",
+              headers={"User-Agent": "tcloc-release (https://github.com/leonardcser/tcloc)"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  published = json.load(response)["version"]["num"] == version
+                  if not published:
+                      raise SystemExit("unexpected version returned by crates.io")
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              published = False
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as file:
+              file.write(f"published={str(published).lower()}\n")
+          if published:
+              print(f"tcloc {version} is already published; skipping upload")
+          PY
+
       - name: Authenticate to crates.io
+        if: steps.registry.outputs.published == 'false'
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish to crates.io
+        if: steps.registry.outputs.published == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
