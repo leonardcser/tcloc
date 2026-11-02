@@ -33,8 +33,8 @@ pub fn squarify_into<T: Clone>(items: &[Item<T>], area: Rect, out: &mut Vec<Tile
 
     out.reserve(items.len());
     let bounds = FRect {
-        x: area.left as f64,
-        y: area.top as f64,
+        x: area.x as f64,
+        y: area.y as f64,
         w: area.width as f64,
         h: area.height as f64,
     };
@@ -133,8 +133,8 @@ fn push_tile<T>(out: &mut Vec<Tile<T>>, x: f64, y: f64, w: f64, h: f64, data: T)
     }
     out.push(Tile {
         rect: Rect {
-            top: yi.max(0) as u16,
-            left: xi.max(0) as u16,
+            y: yi.max(0) as u16,
+            x: xi.max(0) as u16,
             width,
             height,
         },

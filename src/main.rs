@@ -24,10 +24,12 @@ use crate::app::{App, NavDir, TileTarget};
 use crate::cli::Cli;
 use crate::scanner::ScanEvent;
 use crate::watcher::{CachedMeta, MetaCache, WatchEvent};
+use std::alloc::System;
+
 use smelt_perf::alloc::Counting;
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: Counting = Counting::new(System);
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
@@ -60,7 +62,6 @@ fn main() -> io::Result<()> {
 
     let mut term = TerminalSession::builder()
         .buffer_capacity(256 * 1024)
-        .hide_cursor(false)
         .enter_stdout()?;
     let (term_w, term_h) = term.size()?;
     let mut ui = Surface::new(term_w, term_h);
